@@ -34,6 +34,10 @@ class UnsupportedError(SqlglotError):
     pass
 
 
+class BindError(SqlglotError):
+    """Error raised when parameter binding cannot be resolved for a transpiled statement."""
+
+
 class ParseError(SqlglotError):
     def __init__(
         self,

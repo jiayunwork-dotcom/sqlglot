@@ -14,9 +14,11 @@ import logging
 import typing as t
 
 from sqlglot import expressions as exp
+from sqlglot.bind import BoundSQL as BoundSQL, transpile_bound as transpile_bound
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
+    BindError as BindError,
     ErrorLevel as ErrorLevel,
     ParseError as ParseError,
     TokenError as TokenError,

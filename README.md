@@ -196,6 +196,82 @@ FROM bar /* comment 5 */, tbl /*          comment 6 */
 ```
 
 
+### Transpiling with Bound Parameters
+
+`transpile` returns only SQL, so when a statement has parameters you also need to know
+where their values go in the generated SQL. Expressions can be reordered, duplicated or
+dropped during transpilation, which means passing the original parameters in their
+original order can bind the wrong value. `transpile_bound` tracks this for you:
+
+```python
+from sqlglot import transpile_bound
+
+bound = transpile_bound(
+    "SELECT STRPOS(?, ?)",
+    ["haystack", "needle"],
+    read="duckdb",
+    write="mysql",
+    source_style="qmark",
+    target_style="qmark",
+)
+bound.sql              # 'SELECT LOCATE(?, ?)'
+bound.parameters       # ('needle', 'haystack')
+bound.parameter_order  # (2, 1)
+```
+
+The source parameters are written in one of three styles, selected with `source_style`:
+
+- `qmark`: `?` markers, numbered from 1 by their position in the input SQL. `parameters`
+  must be a `list` or `tuple` whose length matches the number of markers.
+- `named`: `:name` markers, where names match `[A-Za-z_][A-Za-z0-9_]*`. `parameters` must
+  be a `Mapping` whose keys are exactly the names used. Repeating a name refers to the
+  same parameter.
+- `numeric`: `$n` markers, where `n` is a 1-based integer without leading zeroes.
+  `parameters` must be a `list` or `tuple` covering every index up to the largest `$n`.
+  Holes are allowed; their input values are simply not carried into the target bindings.
+
+The target style is selected with `target_style`:
+
+- `qmark` emits `?`, and `parameters` is a `tuple` ordered by placeholder.
+- `numeric` emits `$1`, `$2`, ... numbered by first use, and `parameters` is a `tuple`
+  ordered by slot.
+- `named` emits `:p1`, `:p2`, ... numbered by first use, and `parameters` is a new `dict`
+  keyed by `p1`, `p2`, ...
+
+`parameter_order` lists the source identity at each target slot: an `int` for `qmark` and
+`numeric` sources, and a `str` name for `named` sources. Distinct source parameters are
+kept distinct even if their values compare equal, and a parameter the generator eliminates
+does not occupy a target slot (the input is still validated against the original SQL).
+Values are passed through untouched; SQLGlot never stringifies, compares, hashes or copies
+them.
+
+```python
+from sqlglot import transpile_bound
+
+bound = transpile_bound(
+    "SELECT ? AS a, ? AS b ORDER BY a NULLS LAST",
+    ["x", "y"],
+    read="duckdb",
+    write="mysql",
+    source_style="qmark",
+)
+bound.sql
+# 'SELECT ? AS a, ? AS b ORDER BY CASE WHEN ? IS NULL THEN 1 ELSE 0 END, ?'
+bound.parameters       # ('x', 'y', 'x', 'x')
+bound.parameter_order  # (1, 2, 1, 1)
+```
+
+`transpile_bound` handles exactly one non-empty statement and accepts the usual generator
+options (`pretty`, `identify`, `comments`, `unsupported_level`, ...), as well as
+`error_level` for the parser. `sqlglot.errors.BindError` signals problems with the
+parameters or styles (missing/extra parameters, invalid numeric indices, mixed styles,
+unknown styles, empty or multiple statements); syntax errors still raise `ParseError`, and
+unsupported constructs follow the configured `unsupported_level`. Parameter values never
+appear in diagnostics. The function does not connect to a database: choosing a target
+style your driver accepts is up to you (for example, `sqlite3` accepts all three styles,
+while `duckdb` accepts `qmark` and `numeric`).
+
+
 ### Metadata
 
 You can explore SQL with expression helpers to do things like find columns and tables in a query:
