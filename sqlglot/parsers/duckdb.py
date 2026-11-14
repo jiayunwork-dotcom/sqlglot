@@ -50,11 +50,12 @@ def _build_array_prepend(args: list) -> exp.Expr:
 def _build_date_diff(args: list) -> exp.Expr:
     unit = seq_get(args, 0)
 
-    # DATE_DIFF counts the unit boundaries crossed, e.g. one month from 2026-01-31 to 2026-02-01,
-    # except for WEEK, which counts whole 7-day spans
-    date_part_boundary = (
-        isinstance(unit, (exp.Literal, exp.Var)) and unit.name.upper() not in ("WEEK", "WEEKS", "W")
-    ) or None
+    if isinstance(unit, (exp.Literal, exp.Var)):
+        # DATE_DIFF counts the unit boundaries crossed, e.g. one month from 2026-01-31
+        # to 2026-02-01, except for WEEK, which counts whole 7-day spans
+        date_part_boundary: bool | None = unit.name.upper() not in ("WEEK", "WEEKS", "W")
+    else:
+        date_part_boundary = None
 
     return exp.DateDiff(
         this=seq_get(args, 2),
@@ -62,6 +63,23 @@ def _build_date_diff(args: list) -> exp.Expr:
         unit=unit,
         date_part_boundary=date_part_boundary,
     )
+
+
+def _build_date_add(args: list) -> exp.Expr:
+    # DuckDB's DATE_ADD(x, INTERVAL ...) is exactly x + INTERVAL ..., i.e. the result
+    # is a TIMESTAMP even for DATE arguments, unlike most dialects' DATE_ADD. Tag the
+    # node so generators can preserve DuckDB's semantics.
+    date_add = exp.DateAdd(this=seq_get(args, 0), expression=seq_get(args, 1))
+    date_add.meta["duckdb"] = True
+    return date_add
+
+
+def _build_date_part(args: list) -> exp.Expr:
+    unit = seq_get(args, 0)
+    if isinstance(unit, (exp.Literal, exp.Var)):
+        return exp.Extract(this=unit, expression=seq_get(args, 1))
+    # e.g. DATE_PART(['year', 'month', 'day'], x)
+    return exp.Anonymous(this="DATE_PART", expressions=args)
 
 
 def _build_generate_series(end_exclusive: bool = False) -> t.Callable[[list], exp.GenerateSeries]:
@@ -184,7 +202,9 @@ class DuckDBParser(parser.Parser):
         "BIT_XOR": exp.BitwiseXorAgg.from_arg_list,
         "CURRENT_LOCALTIMESTAMP": exp.Localtimestamp.from_arg_list,
         "DATEDIFF": _build_date_diff,
+        "DATE_ADD": _build_date_add,
         "DATE_DIFF": _build_date_diff,
+        "DATE_PART": _build_date_part,
         "DATE_TRUNC": date_trunc_to_time,
         "DATETRUNC": date_trunc_to_time,
         "DECODE": lambda args: exp.Decode(

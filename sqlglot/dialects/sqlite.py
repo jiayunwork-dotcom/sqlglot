@@ -13,6 +13,14 @@ from sqlglot.tokens import TokenType
 
 
 class SQLite(Dialect):
+    """SQLite dialect.
+
+    See :class:`sqlglot.generators.sqlite.SQLiteGenerator` for how DuckDB date/time
+    constructs (INTERVAL arithmetic, DATE_TRUNC, DATE_DIFF, EXTRACT/DATE_PART,
+    LAST_DAY, temporal CASTs and comparisons) are mapped to semantically
+    equivalent SQLite, and which of them are reported as unsupported.
+    """
+
     # https://sqlite.org/forum/forumpost/5e575586ac5c711b?raw
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
     ASCII_ONLY_NORMALIZATION = True
