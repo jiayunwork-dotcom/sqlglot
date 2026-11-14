@@ -24,6 +24,36 @@ table columns listed there are considered to carry a ``NOT NULL`` constraint.
 Every other base-table column is treated as potentially nullable, regardless
 of its declared data type.
 
+Outer joins and predicate-driven recovery
+-----------------------------------------
+
+A LEFT/RIGHT/FULL join NULL-pads the columns of its nullable side, so even a
+base-table ``NOT NULL`` column becomes nullable until its source row is proven
+present (i.e. the row is not a synthetic NULL-padded row). Presence is
+established in two ways:
+
+1. A NULL-rejecting WHERE/HAVING predicate applied directly to a plain column
+   of the source (``b.id IS NOT NULL``, ``b.v > 0``, ``b.v IN (...)``, ...).
+   Under AND every branch contributes; under OR a source is proven present only
+   when *every* branch proves it.
+2. Presence propagation through join ON clauses. When every top-level AND
+   conjunct of a LEFT/RIGHT join's ON is an equality between plain columns of
+   two different sources (``a.id = b.id``), a matched row makes every such
+   column non-NULL, so presence on one side proves presence of the partners.
+   This is what lets a filter on the last table of a pure-equality LEFT-join
+   chain recover every ``NOT NULL`` column along the chain.
+
+Recovery is deliberately conservative: no presence is inferred through an ON
+clause containing an OR, a non-equality predicate, an expression operand such
+as ``COALESCE(...)``, or a null-safe comparison (``IS NOT DISTINCT FROM``),
+because all of those can hold on a NULL-padded row. FULL joins never
+propagate presence: each side may exist without the other. A source NULL-padded
+by such a "weak" join cannot be recovered through later joins either; it stays
+nullable unless a WHERE/HAVING predicate proves it present directly. An
+expression-level guarantee (e.g. a column compared through ``COALESCE``) can
+still mark a specific projected expression non-NULL without claiming the
+underlying source row exists.
+
 Args:
     expression: A SQL string or a parsed query (``SELECT`` / set operations
         such as ``UNION`` / ``INTERSECT`` / ``EXCEPT``, including ``WITH``
@@ -100,6 +130,22 @@ _NULL_REJECTING_COMPARISONS: tuple[type[exp.Predicate], ...] = (
     exp.LT,
     exp.LTE,
 )
+
+
+def _flatten_and(predicate: exp.Expr | None) -> list[exp.Expr]:
+    """Return the top-level AND conjuncts of ``predicate`` in linear time."""
+    if predicate is None:
+        return []
+    conjuncts: list[exp.Expr] = []
+    stack: list[exp.Expr] = [predicate]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.And):
+            stack.append(node.right)
+            stack.append(node.left)
+        else:
+            conjuncts.append(node)
+    return conjuncts
 
 
 def infer_nullability(
@@ -215,8 +261,18 @@ class _NullabilityAnalyzer:
         # Per-scope memo of expression id -> nullable. None values are not
         # stored, so None doubles as the "not yet computed" sentinel.
         self._memo: dict[int, bool] = {}
+        # Columns/expressions guaranteed non-NULL on every retained row by a
+        # NULL-rejecting WHERE/HAVING predicate. These are expression-level
+        # guarantees only: predicates that accept NULL-padded rows (e.g.
+        # null-safe comparisons) still make it in here without proving that
+        # the underlying outer-joined source row exists.
         self._guaranteed_columns: set[tuple[str, str]] = set()
         self._guaranteed_node_ids: set[int] = set()
+        # Sources whose *row* is guaranteed present (not NULL-padded) on every
+        # retained row. Only predicates that necessarily reject NULL-padded
+        # rows of a source establish presence; this is what drives outer-join
+        # recovery and presence propagation through ON equalities.
+        self._present_sources: set[str] = set()
         # Column nodes NULL-synthesized by ROLLUP/CUBE/GROUPING SETS subtotals.
         self._nullified_grouping_columns: set[tuple[str, str]] = set()
 
@@ -286,11 +342,13 @@ class _NullabilityAnalyzer:
         self._memo = {}
         self._guaranteed_columns = set()
         self._guaranteed_node_ids = set()
+        self._present_sources = set()
         self._nullified_grouping_columns: set[tuple[str, str]] = set()
 
-        # 1. Columns guaranteed non-NULL by WHERE/HAVING predicates. These
-        #    additionally recover NOT NULL columns nullified by outer joins
-        #    when the predicate rejects the NULL-padded rows.
+        # 1. Columns guaranteed non-NULL by WHERE/HAVING predicates. The
+        #    subset of predicates that reject NULL-padded rows additionally
+        #    establishes source presence, which recovers NOT NULL columns
+        #    nullified by outer joins.
         where = select.args.get("where")
         if where:
             self._collect_guarantees(where.this, scope)
@@ -352,32 +410,44 @@ class _NullabilityAnalyzer:
                         nullified.add(key)
         return nullified
 
-    def _join_on_partners(self, select: exp.Select) -> dict[str, set[str]]:
+    def _on_equality_pairs(self, on: exp.Expr) -> t.Iterator[tuple[str, str]]:
         """
-        For each joined source, collect the other sources referenced by an
-        *equality* in that join's ON clause. When the joined source's row is
-        present (it matched its ON predicate), each equality operand on another
-        source is non-NULL, so that partner row is present too.
+        Yield ``(source_a, source_b)`` pairs for the plain column equalities
+        in a join's ON clause, but only when *every* top-level AND conjunct is
+        an equality between plain columns of two different sources.
 
-        Only equality predicates are considered: non-equality conditions
-        (``>``, ``IS NOT NULL``, ...) can hold on a NULL-padded row, so they
-        cannot prove that a partner row exists.
+        Such an equality can only hold when both operands are non-NULL, so on a
+        row where the join matched, both referenced source rows exist. The
+        all-conjuncts restriction is essential: any other conjunct shape may
+        still hold (or be skipped, inside an OR) on a NULL-padded row, in which
+        case a matched join no longer proves that every equality partner
+        exists. Concretely, no pairs are yielded when the ON contains:
+
+        - an OR (an equality on one branch may sit on a branch that never held);
+        - ``COALESCE(...) = x`` or another expression operand;
+        - a null-safe comparison (``IS NOT DISTINCT FROM``), which is true on
+          NULL-padded rows;
+        - non-equality predicates (``>``, ``IS NOT NULL``, ...).
         """
-        partners: dict[str, set[str]] = {}
-        for join in select.args.get("joins") or []:
-            source_name = join.alias_or_name
-            on = join.args.get("on")
-            if not source_name or on is None:
-                continue
+        conjuncts = _flatten_and(on)
+        pairs: list[tuple[str, str]] = []
+        for conjunct in conjuncts:
+            equality = conjunct.this if isinstance(conjunct, exp.Paren) else conjunct
+            if not isinstance(equality, exp.EQ):
+                return
 
-            referenced: set[str] = set()
-            for equality in on.find_all(exp.EQ):
-                for operand in (equality.left, equality.right):
-                    column = operand if isinstance(operand, exp.Column) else None
-                    if column and column.table and column.table != source_name:
-                        referenced.add(column.table)
-            partners.setdefault(source_name, set()).update(referenced)
-        return partners
+            left = equality.left if isinstance(equality.left, exp.Column) else None
+            right = equality.right if isinstance(equality.right, exp.Column) else None
+            if (
+                left is None
+                or right is None
+                or not left.table
+                or not right.table
+                or left.table == right.table
+            ):
+                return
+            pairs.append((left.table, right.table))
+        yield from pairs
 
     def _build_source_nullability(
         self, scope: Scope, select: exp.Select
@@ -396,6 +466,21 @@ class _NullabilityAnalyzer:
         # Sources nullified by an outer join side; their NOT NULL columns can
         # only be recovered through WHERE/HAVING guarantees.
         nullified_sources: set[str] = set()
+
+        # Subset of ``nullified_sources`` whose nullifying LEFT/RIGHT join has
+        # a "pure-equality" ON clause (every top-level AND conjunct compares
+        # plain columns of two different sources). Only such sources can be
+        # reached by presence propagation: a source nullified through a weak
+        # predicate (OR, COALESCE, null-safe comparison, ...) may stay absent
+        # even while a later join referencing it matches.
+        recoverable_via_on: set[str] = set()
+
+        # Presence propagation edges. An edge ``x -> y`` means: whenever source
+        # x's row is present in the output (its join actually matched), the
+        # top-level ON equality proves source y's row is present too. Edges
+        # originate only on the nullified side of LEFT/RIGHT joins; FULL joins
+        # provide no edges because either side may exist on its own.
+        presence_edges: dict[str, set[str]] = {}
 
         for join in select.args.get("joins") or []:
             source_name = join.alias_or_name
@@ -416,65 +501,78 @@ class _NullabilityAnalyzer:
             elif side == "LEFT":
                 result[source_name] = {column: True for column in intrinsic}
                 nullified_sources.add(source_name)
+                on_pairs = list(self._on_equality_pairs(join.args.get("on")))
+                if on_pairs:
+                    recoverable_via_on.add(source_name)
+                    # The right source is the nullified side: if it is present,
+                    # every partner named in a pure top-level ON equality is
+                    # present too.
+                    for left_table, right_table in on_pairs:
+                        partner = (
+                            right_table if left_table == source_name else left_table
+                        )
+                        if partner in scope.sources:
+                            presence_edges.setdefault(source_name, set()).add(partner)
             elif side == "RIGHT":
+                nullified_side = set(result.keys() - {source_name})
                 result[source_name] = dict(intrinsic)
-                nullified_sources.update(result.keys() - {source_name})
-                for name in result.keys() - {source_name}:
+                nullified_sources.update(nullified_side)
+                for name in nullified_side:
                     result[name] = {column: True for column in result[name]}
+                on_pairs = list(self._on_equality_pairs(join.args.get("on")))
+                if on_pairs:
+                    # The pre-join (left) sources are the nullified side: if
+                    # any of them is present, every equality partner is present
+                    # too.
+                    recoverable_via_on.update(nullified_side)
+                    for left_table, right_table in on_pairs:
+                        if left_table in nullified_side:
+                            presence_edges.setdefault(left_table, set()).add(
+                                right_table
+                            )
+                        if right_table in nullified_side:
+                            presence_edges.setdefault(right_table, set()).add(
+                                left_table
+                            )
             elif side == "FULL":
                 result[source_name] = {column: True for column in intrinsic}
                 nullified_sources.add(source_name)
+                recoverable_via_on.discard(source_name)
                 for name in list(result.keys() - {source_name}):
                     result[name] = {column: True for column in result[name]}
                     nullified_sources.add(name)
+                    # A later FULL join can pad sources even when an earlier
+                    # join proved their presence, so no ON-based recovery of
+                    # those sources is sound.
+                    recoverable_via_on.discard(name)
+                # Either side may exist without the other, so no presence edge
+                # is sound here, even with an equality ON clause.
             else:
                 # INNER / CROSS joins preserve the intrinsic nullability.
                 result[source_name] = dict(intrinsic)
 
-        # Recover NOT NULL columns of outer-join-nullified sources when a
-        # WHERE/HAVING predicate guarantees that *some* column of the source
-        # is non-NULL, which excludes every NULL-padded row of that source.
-        # Recovery also propagates inward along LEFT-join chains: if the
-        # right side of a LEFT JOIN is present, its ON equality matched, so
-        # every equality operand on another source is non-NULL and that
-        # partner row is present too. FULL/RIGHT joins never participate:
-        # knowing one side is present does not prove the other side is.
+        # Recover NOT NULL columns of outer-join-nullified sources.
+        #
+        # The seed set is the sources directly proven present by a
+        # NULL-rejecting WHERE/HAVING predicate: a non-NULL value of one of
+        # their plain columns cannot occur on a NULL-padded row. Predicates
+        # that merely compare a non-NULL expression (COALESCE, null-safe
+        # equality, ...) do not seed presence. From each proven source,
+        # presence propagates outward along the ON-equality edges collected
+        # above (e.g. inward along LEFT-join chains: a present right side
+        # implies its ON-equality partners are present as well), but only into
+        # sources nullified by a pure-equality outer join.
         guaranteed_sources = {
-            table
-            for table, _ in self._guaranteed_columns
-            if table in nullified_sources
-        }
-        on_partners = self._join_on_partners(select)
-        left_join_names = {
-            join.alias_or_name
-            for join in select.args.get("joins") or []
-            if join.side == "LEFT" and join.alias_or_name
-        }
-
-        # ``depends_on[x]`` is the set of *nullified* sources that LEFT-joined
-        # source x references in its ON equality: x can only be present when
-        # those partners are present too. Partners on the preserved (left)
-        # side need no recovery, so they are excluded here. Starting from the
-        # directly guaranteed sources, repeatedly recover every nullified
-        # source whose nullified dependencies are all satisfied.
-        depends_on: dict[str, set[str]] = {
-            source_name: {
-                partner
-                for partner in on_partners.get(source_name, set())
-                if partner in nullified_sources
-            }
-            for source_name in left_join_names & nullified_sources
+            source for source in self._present_sources if source in nullified_sources
         }
 
         worklist = list(guaranteed_sources)
         while worklist:
             current = worklist.pop()
-            for source_name, required in depends_on.items():
-                if source_name in guaranteed_sources:
-                    continue
-                if required <= guaranteed_sources:
-                    guaranteed_sources.add(source_name)
-                    worklist.append(source_name)
+            for partner in presence_edges.get(current, ()):
+                if partner in recoverable_via_on and partner not in guaranteed_sources:
+                    guaranteed_sources.add(partner)
+                    worklist.append(partner)
 
         for source_name in nullified_sources:
             source_columns = result.get(source_name, {})
@@ -597,10 +695,17 @@ class _NullabilityAnalyzer:
     def _collect_guarantees(self, predicate: exp.Expr, scope: Scope) -> None:
         """
         Collect expressions that are guaranteed non-NULL when ``predicate``
-        evaluates to TRUE. The result is stored as two sets:
+        evaluates to TRUE. The result is stored in three per-scope sets:
 
         - ``_guaranteed_columns``: qualified ``(source, column)`` pairs
         - ``_guaranteed_node_ids``: ids of arbitrary non-column expressions
+        - ``_present_sources``: sources whose row cannot be NULL-padded
+
+        The first two are expression-level guarantees. Presence is stricter:
+        it is established only by a NULL-rejecting predicate applied directly
+        to a plain column of the source, so predicates that accept
+        NULL-padded rows (null-safe comparisons, COALESCE, ...) never add a
+        source here even when the compared expression is provably non-NULL.
 
         Parenthesized wrappers are handled later by the expression-level
         nullability check itself.
@@ -610,6 +715,104 @@ class _NullabilityAnalyzer:
             self._guaranteed_node_ids.add(id(expression))
             if isinstance(expression, exp.Column) and expression.table:
                 self._guaranteed_columns.add((expression.table, expression.name))
+
+        self._present_sources.update(self._presence_guarantees(predicate, scope))
+
+    def _presence_guarantees(
+        self, predicate: exp.Expr, scope: Scope
+    ) -> set[str]:
+        """
+        Return the sources whose row is guaranteed present (not NULL-padded)
+        on every row for which ``predicate`` is TRUE.
+
+        A leaf NULL-rejecting predicate proves presence for the sources of its
+        plain-column operands. AND unions the guarantees of its branches, OR
+        intersects them (a source is present only if every branch proves it).
+        """
+        if isinstance(predicate, exp.Paren):
+            return self._presence_guarantees(predicate.this, scope)
+
+        if isinstance(predicate, exp.And):
+            return self._presence_guarantees(
+                predicate.left, scope
+            ) | self._presence_guarantees(predicate.right, scope)
+
+        if isinstance(predicate, exp.Or):
+            return self._presence_guarantees(
+                predicate.left, scope
+            ) & self._presence_guarantees(predicate.right, scope)
+
+        if isinstance(predicate, exp.Not):
+            inner = predicate.this
+            if isinstance(inner, exp.Paren):
+                inner = inner.this
+            if isinstance(inner, exp.Not):
+                # NOT NOT p is equivalent to p.
+                inner_inner = inner.this
+                if isinstance(inner_inner, exp.Paren):
+                    inner_inner = inner_inner.this
+                return self._presence_guarantees(inner_inner, scope)
+            if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
+                # NOT(x IS NULL), i.e. x IS NOT NULL: rejects NULL x directly.
+                # A nested expression (e.g. NOT(COALESCE(...) IS NULL)) proves
+                # nothing about source presence.
+                return self._operand_sources(inner.this)
+            # Any other negated predicate (NOT IN, NOT BETWEEN, ...) is not
+            # reliably NULL-rejecting, so nothing is inferred.
+            return set()
+
+        if isinstance(predicate, exp.Is):
+            # A plain x IS NULL does not reject NULLs; x IS NOT NULL is
+            # normalized to NOT(x IS NULL) and handled above.
+            return set()
+
+        if isinstance(predicate, _NULL_REJECTING_COMPARISONS):
+            # Only *direct* plain-column operands establish presence: e.g.
+            # COALESCE(b.id, 9) = c.id is true on a NULL-padded b row, and a
+            # null-safe comparison never rejects NULLs in the first place. A
+            # column nested inside an expression is deliberately ignored.
+            return self._operand_sources(predicate.left) | self._operand_sources(
+                predicate.right
+            )
+
+        if isinstance(predicate, exp.In):
+            # x IN (...) rejects NULL x, including subquery and list forms.
+            return self._operand_sources(predicate.this)
+
+        if isinstance(predicate, exp.Between):
+            # x BETWEEN low AND high rejects NULL x.
+            return self._operand_sources(predicate.this)
+
+        if isinstance(predicate, exp.Column):
+            # A bare boolean column must be TRUE, hence non-NULL.
+            return self._column_sources(predicate)
+
+        return set()
+
+    def _operand_sources(self, expression: exp.Expr | None) -> set[str]:
+        """
+        Sources proven present by a single predicate operand. Only a bare
+        column (optionally parenthesized) qualifies: an operand built around a
+        column, such as ``COALESCE(b.id, 0)`` or ``b.id + 1``, can stay
+        non-NULL on a NULL-padded row and therefore proves nothing.
+        """
+        if expression is None:
+            return set()
+        if isinstance(expression, exp.Paren):
+            return self._operand_sources(expression.this)
+        if isinstance(expression, exp.Column) and expression.table:
+            return {expression.table}
+        return set()
+
+    def _column_sources(self, expression: exp.Expr | None) -> set[str]:
+        """Sources of the plain columns directly appearing in ``expression``."""
+        if expression is None:
+            return set()
+        return {
+            column.table
+            for column in expression.find_all(exp.Column)
+            if column.table
+        }
 
     def _null_rejecting_expressions(
         self, predicate: exp.Expr, scope: Scope

@@ -691,6 +691,500 @@ class TestNullability(unittest.TestCase):
                 )
 
 
+class TestJoinRecoveryNullability(unittest.TestCase):
+    """
+    Outer-join presence recovery: NULL-padded rows must never be mistaken for
+    present source rows. Expected results are derived from SQL semantics, not
+    from the implementation under test, and cross-checked against DuckDB in
+    ``TestJoinRecoveryDuckDB``.
+    """
+
+    maxDiff = None
+
+    SCHEMA = {
+        "a": {"id": "INT", "v": "INT"},
+        "b": {"id": "INT", "v": "INT"},
+        "c": {"id": "INT", "v": "INT"},
+    }
+    NOT_NULL = {"a": {"id"}, "b": {"id"}, "c": {"id"}}
+
+    def infer(self, sql):
+        return infer_nullability(
+            sql, schema=self.SCHEMA, not_null=self.NOT_NULL, dialect=DIALECT
+        )
+
+    def assert_nullable(self, expected, sql):
+        self.assertEqual(expected, self.infer(sql), msg=sql)
+
+    # ------------------------------------------------------------------
+    # Reported regressions: filtering one side must not recover another
+    # side that is still NULL-padded.
+    # ------------------------------------------------------------------
+
+    def test_filter_on_b_does_not_recover_independent_c(self):
+        # a=(1,NULL), b=(1,NULL), c empty: WHERE keeps the (a,b) match while
+        # c stays NULL-padded.
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id
+            WHERE b.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", False), ("cid", True)], sql)
+
+    def test_or_in_on_blocks_recovery_of_partner(self):
+        # a=(2,NULL), b empty, c=(9,1): the OR branch matches c while b stays
+        # NULL-padded.
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id OR a.id = 2
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", True), ("cid", False)], sql)
+
+    def test_coalesce_in_on_blocks_recovery_of_partner(self):
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON COALESCE(b.id, 9) = c.id
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", True), ("cid", False)], sql)
+
+    def test_null_safe_on_blocks_recovery_of_partner(self):
+        # b's join accepts its NULL-padded row, so c matching later cannot
+        # prove b exists.
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id IS NOT DISTINCT FROM b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", True), ("cid", False)], sql)
+
+    def test_mixed_or_in_later_on_blocks_chain_recovery(self):
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id IS NOT DISTINCT FROM b.id
+            LEFT JOIN c ON b.id = c.id OR a.id = c.id
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", True), ("cid", False)], sql)
+
+    # ------------------------------------------------------------------
+    # Guarantees that must keep working.
+    # ------------------------------------------------------------------
+
+    def test_filter_recovers_both_id_and_filtered_column(self):
+        for predicate in ("b.v > 0", "b.v = 1", "b.v IS NOT NULL"):
+            with self.subTest(predicate=predicate):
+                sql = f"""
+                    SELECT b.id AS bid, b.v AS bv
+                    FROM a LEFT JOIN b ON a.id = b.id
+                    WHERE {predicate}
+                """
+                self.assert_nullable([("bid", False), ("bv", False)], sql)
+
+    def test_unfiltered_nullable_column_stays_nullable_after_recovery(self):
+        # b.id is NOT NULL and recovered; b.v has no NOT NULL constraint and is
+        # not itself filtered, so it remains nullable.
+        sql = """
+            SELECT b.id AS bid, b.v AS bv
+            FROM a LEFT JOIN b ON a.id = b.id
+            WHERE b.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", False), ("bv", True)], sql)
+
+    def test_pure_equality_chain_recovers_all_not_null_columns(self):
+        sql = """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.v > 0
+        """
+        self.assert_nullable(
+            [("aid", False), ("bid", False), ("cid", False)], sql
+        )
+
+    def test_chain_extended_with_and_equalities_recovers_all(self):
+        sql = """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id AND a.v = b.v
+            LEFT JOIN c ON b.id = c.id AND b.v = c.v
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable(
+            [("aid", False), ("bid", False), ("cid", False)], sql
+        )
+
+    def test_filter_on_b_leaves_unmatched_c_nullable(self):
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE b.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", False), ("cid", True)], sql)
+
+    def test_inner_and_cross_keep_intrinsic_nullability(self):
+        self.assert_nullable(
+            [("aid", False), ("bid", False)],
+            "SELECT a.id AS aid, b.id AS bid FROM a INNER JOIN b ON a.id = b.id",
+        )
+        self.assert_nullable(
+            [("aid", False), ("bid", False)],
+            "SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b",
+        )
+
+    def test_full_join_never_propagates_presence(self):
+        self.assert_nullable(
+            [("aid", False), ("bid", True)],
+            """
+            SELECT a.id AS aid, b.id AS bid
+            FROM a FULL JOIN b ON a.id = b.id
+            WHERE a.id IS NOT NULL
+            """,
+        )
+        self.assert_nullable(
+            [("aid", True), ("bid", False)],
+            """
+            SELECT a.id AS aid, b.id AS bid
+            FROM a FULL JOIN b ON a.id = b.id
+            WHERE b.id IS NOT NULL
+            """,
+        )
+
+    def test_right_join_recovery_through_equality(self):
+        sql = """
+            SELECT a.id AS aid, b.id AS bid
+            FROM a RIGHT JOIN b ON a.id = b.id
+            WHERE a.id IS NOT NULL
+        """
+        self.assert_nullable([("aid", False), ("bid", False)], sql)
+
+    def test_right_join_with_weak_on_is_conservative(self):
+        sql = """
+            SELECT a.id AS aid, b.id AS bid
+            FROM a RIGHT JOIN b ON a.id IS NOT DISTINCT FROM b.id
+            WHERE b.id IS NOT NULL
+        """
+        self.assert_nullable([("aid", True), ("bid", False)], sql)
+
+    def test_or_requires_presence_in_every_branch(self):
+        # Only one branch proves c present: c must stay nullable.
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE b.id IS NOT NULL OR c.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", True), ("cid", True)], sql)
+
+        # Both branches prove b present: b is recovered, c is not mentioned.
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE b.id > 0 OR b.id = 1
+        """
+        self.assert_nullable([("bid", False), ("cid", True)], sql)
+
+    def test_coalesce_predicate_does_not_seed_presence(self):
+        # COALESCE stays non-NULL on a NULL-padded b row, so b is not present;
+        # c is directly guaranteed by its own plain-column predicate.
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON COALESCE(a.id, 0) = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable([("bid", True), ("cid", False)], sql)
+
+    def test_nested_column_in_where_expression_does_not_seed_presence(self):
+        # The column is buried in COALESCE / arithmetic. The predicate is
+        # NULL-rejecting for the whole expression, but the source row can
+        # still be NULL-padded, so b must stay nullable. c is a direct operand
+        # and remains guaranteed.
+        self.assert_nullable(
+            [("bid", True), ("cid", False)],
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id OR 1 = 1
+            WHERE COALESCE(b.id, 0) = c.id
+            """,
+        )
+        self.assert_nullable(
+            [("bid", True), ("cid", False)],
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id OR 1 = 1
+            WHERE b.id + 1 = c.id
+            """,
+        )
+        self.assert_nullable(
+            [("bid", True), ("cid", True)],
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id OR 1 = 1
+            WHERE NOT (COALESCE(b.id, 0) IS NULL)
+            """,
+        )
+        # A parenthesized bare column is still a direct operand.
+        self.assert_nullable(
+            [("bid", False), ("cid", True)],
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE (b.id) IS NOT NULL
+            """,
+        )
+
+    def test_non_equality_on_clause_blocks_on_recovery(self):
+        # b's ON mixes the equality with a range predicate, so it produces no
+        # presence edge: c being present cannot recover b through the join.
+        sql = """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id AND b.v > 0
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable(
+            [("aid", False), ("bid", True), ("cid", False)], sql
+        )
+
+        # The same chain with a pure-equality ON does recover b.
+        pure_sql = """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.id IS NOT NULL
+        """
+        self.assert_nullable(
+            [("aid", False), ("bid", False), ("cid", False)], pure_sql
+        )
+
+    # ------------------------------------------------------------------
+    # Equivalent rewrites, scoping, aliasing
+    # ------------------------------------------------------------------
+
+    def test_derived_table_wrapper_preserves_result(self):
+        wrapped = """
+            SELECT bid, cid FROM (
+                SELECT b.id AS bid, c.id AS cid
+                FROM a
+                LEFT JOIN b ON a.id = b.id
+                LEFT JOIN c ON a.id = c.id
+                WHERE b.id IS NOT NULL
+            ) d
+        """
+        direct = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id
+            WHERE b.id IS NOT NULL
+        """
+        self.assertEqual(self.infer(wrapped), self.infer(direct))
+
+    def test_forwarding_cte_preserves_result(self):
+        sql = """
+            WITH d AS (
+                SELECT b.id AS bid, c.id AS cid
+                FROM a
+                LEFT JOIN b ON a.id = b.id
+                LEFT JOIN c ON b.id = c.id OR a.id = 2
+                WHERE c.id IS NOT NULL
+            )
+            SELECT bid, cid FROM d
+        """
+        self.assert_nullable([("bid", True), ("cid", False)], sql)
+
+    def test_alias_shadowing_does_not_leak_between_scopes(self):
+        # Both scopes call a source "b"; the inner filter on b must not recover
+        # the outer b. Output positions are compared explicitly.
+        sql = """
+            SELECT b.id AS outer_bid, d.x AS inner_bid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            JOIN (
+                SELECT b2.id AS x
+                FROM a AS a2
+                LEFT JOIN b AS b2 ON a2.id = b2.id
+                WHERE b2.id IS NOT NULL
+            ) d ON d.x = a.id
+        """
+        # Outer b is still nullable; the inner derived column is not nullable.
+        self.assert_nullable([("outer_bid", True), ("inner_bid", False)], sql)
+
+    def test_renaming_table_aliases_is_positionally_stable(self):
+        sql1 = """
+            SELECT x.id AS xid, y.id AS yid
+            FROM a AS x LEFT JOIN b AS y ON x.id = y.id
+            WHERE y.id IS NOT NULL
+        """
+        sql2 = """
+            SELECT p.id AS xid, q.id AS yid
+            FROM a AS p LEFT JOIN b AS q ON p.id = q.id
+            WHERE q.id IS NOT NULL
+        """
+        self.assertEqual(self.infer(sql1), self.infer(sql2))
+
+    def test_independent_left_joins_order_invariant(self):
+        # The two ON clauses reference only the preserved side and their own
+        # right table, so swapping b and c must not change positional results
+        # after aligning output positions.
+        sql1 = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id
+            WHERE b.id IS NOT NULL
+        """
+        sql2 = """
+            SELECT c.id AS cid, b.id AS bid
+            FROM a
+            LEFT JOIN c ON a.id = c.id
+            LEFT JOIN b ON a.id = b.id
+            WHERE b.id IS NOT NULL
+        """
+        self.assertEqual(
+            {name: nullable for name, nullable in self.infer(sql1)},
+            {name: nullable for name, nullable in self.infer(sql2)},
+        )
+
+    # ------------------------------------------------------------------
+    # Input isolation
+    # ------------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        import sqlglot
+
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id OR a.id = 2
+            WHERE c.id IS NOT NULL
+        """
+        expression = sqlglot.parse_one(sql, dialect=DIALECT)
+        schema = {name: dict(columns) for name, columns in self.SCHEMA.items()}
+        not_null = {name: set(columns) for name, columns in self.NOT_NULL.items()}
+        before_sql = expression.sql()
+        before_schema = {name: dict(columns) for name, columns in schema.items()}
+        before_nn = {name: set(columns) for name, columns in not_null.items()}
+
+        infer_nullability(
+            expression,
+            schema=schema,
+            not_null=not_null,
+            dialect=DIALECT,
+        )
+
+        self.assertEqual(before_sql, expression.sql())
+        self.assertEqual(before_schema, schema)
+        self.assertEqual(before_nn, not_null)
+
+    # ------------------------------------------------------------------
+    # Scale: no exponential work on wide joins or deep nesting.
+    # ------------------------------------------------------------------
+
+    def test_scale_boundaries_finish_quickly(self):
+        import time
+
+        # 30-table pure-equality LEFT JOIN chain.
+        width = 30
+        tables = {f"t{i}": {"id": "INT", "v": "INT"} for i in range(width)}
+        not_null = {f"t{i}": {"id"} for i in range(width)}
+        chain_sql = (
+            "SELECT "
+            + ", ".join(f"t{i}.id" for i in range(width))
+            + " FROM t0 "
+            + " ".join(
+                f"LEFT JOIN t{i} ON t{i - 1}.id = t{i}.id" for i in range(1, width)
+            )
+            + " WHERE t29.id IS NOT NULL"
+        )
+        started = time.perf_counter()
+        result = infer_nullability(
+            chain_sql, schema=tables, not_null=not_null, dialect=DIALECT
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+        self.assertTrue(all(not nullable for _, nullable in result))
+
+        # 50 levels of column-forwarding derived tables.
+        nested_sql = (
+            "SELECT id FROM "
+            + " ".join("(SELECT id FROM" for _ in range(50))
+            + " t0"
+            + ")" * 50
+        )
+        started = time.perf_counter()
+        self.assertEqual(
+            [("id", False)],
+            infer_nullability(
+                nested_sql,
+                schema={"t0": {"id": "INT"}},
+                not_null={"t0": {"id"}},
+                dialect=DIALECT,
+            ),
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+        # 40 levels of alternating AND/OR, both in WHERE and in an ON clause.
+        predicate = "t0.id IS NOT NULL"
+        for index in range(40):
+            connector = "AND" if index % 2 == 0 else "OR"
+            predicate = f"({predicate} {connector} t0.id > {index})"
+        where_sql = f"SELECT id FROM t0 WHERE {predicate}"
+        started = time.perf_counter()
+        infer_nullability(
+            where_sql,
+            schema={"t0": {"id": "INT"}},
+            not_null={"t0": {"id"}},
+            dialect=DIALECT,
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+        on_predicate = "t0.id = t1.id"
+        for index in range(40):
+            connector = "AND" if index % 2 == 0 else "OR"
+            on_predicate = f"({on_predicate} {connector} t1.id > {index})"
+        on_sql = (
+            f"SELECT t1.id FROM t0 LEFT JOIN t1 ON {on_predicate} "
+            "WHERE t1.id IS NOT NULL"
+        )
+        started = time.perf_counter()
+        infer_nullability(
+            on_sql,
+            schema={"t0": {"id": "INT"}, "t1": {"id": "INT"}},
+            not_null={"t0": {"id"}, "t1": {"id"}},
+            dialect=DIALECT,
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+
 class TestNullabilityDuckDBFuzz(unittest.TestCase):
     """
     Cross-checks every inference against actual DuckDB execution using random
@@ -913,3 +1407,343 @@ class TestNullabilityDuckDBFuzz(unittest.TestCase):
                 sql = f"{sql} {connector} {other}"
             with self.subTest(trial=trial):
                 self._check_query(sql)
+
+
+class TestJoinRecoveryDuckDB(unittest.TestCase):
+    """
+    Executes the join-recovery queries against real DuckDB tables and checks
+    every output position: a column inferred non-NULL (``False``) must never
+    contain a NULL in any result row. Data is generated with a fixed seed and
+    includes empty tables, unmatched rows, nullable values and duplicate keys,
+    all while respecting the declared NOT NULL constraints.
+
+    Uses ``fetchall`` rather than DataFrames so the check has no numpy/pandas
+    dependency. Expected inference results asserted elsewhere are hand-derived
+    from SQL semantics, never produced by the implementation under test.
+    """
+
+    SEED = 20261114
+    SCHEMA = {
+        "a": {"id": "INT", "v": "INT"},
+        "b": {"id": "INT", "v": "INT"},
+        "c": {"id": "INT", "v": "INT"},
+    }
+    NOT_NULL = {"a": {"id"}, "b": {"id"}, "c": {"id"}}
+
+    # (sql, expected inference) for the two reported counterexamples and the
+    # COALESCE / null-safe variants. These expectations are hand-written.
+    HANDED_EXPECTATIONS = [
+        (
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id
+            WHERE b.id IS NOT NULL
+            """,
+            [("bid", False), ("cid", True)],
+        ),
+        (
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id OR a.id = 2
+            WHERE c.id IS NOT NULL
+            """,
+            [("bid", True), ("cid", False)],
+        ),
+        (
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON COALESCE(b.id, 9) = c.id
+            WHERE c.id IS NOT NULL
+            """,
+            [("bid", True), ("cid", False)],
+        ),
+        (
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id IS NOT DISTINCT FROM b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.id IS NOT NULL
+            """,
+            [("bid", True), ("cid", False)],
+        ),
+        (
+            """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.v > 0
+            """,
+            [("aid", False), ("bid", False), ("cid", False)],
+        ),
+    ]
+
+    # Join-side and ON-shape matrix for randomized execution. Every entry must
+    # be executable against the three-table fixture.
+    JOIN_SIDES = ["INNER", "LEFT", "RIGHT", "FULL", "CROSS"]
+    ON_SHAPES = [
+        "a.id = b.id",
+        "a.id = b.id AND a.v = b.v",
+        "a.id = b.id OR a.id = 2",
+        "COALESCE(a.id, 9) = b.id",
+        "a.id IS NOT DISTINCT FROM b.id",
+    ]
+
+    def setUp(self):
+        import random
+
+        self.conn = duckdb.connect()
+        self.rng = random.Random(self.SEED)
+        self.conn.execute("CREATE TABLE a (id INTEGER NOT NULL, v INTEGER)")
+        self.conn.execute("CREATE TABLE b (id INTEGER NOT NULL, v INTEGER)")
+        self.conn.execute("CREATE TABLE c (id INTEGER NOT NULL, v INTEGER)")
+        self._populate("a", rows=12)
+        self._populate("b", rows=12)
+        self._populate("c", rows=12)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _populate(self, table, rows):
+        # Deliberately leave some tables empty on later repopulations and use a
+        # small key domain so duplicate keys and unmatched rows are common.
+        if rows == 0:
+            return
+        values = []
+        for _ in range(rows):
+            key = self.rng.randint(1, 6)
+            v = None if self.rng.random() < 0.4 else self.rng.randint(-2, 5)
+            values.append((key, v))
+        self.conn.executemany(
+            f"INSERT INTO {table} VALUES (?, ?)", values
+        )
+
+    def _repopulate(self, **sizes):
+        for table in ("a", "b", "c"):
+            self.conn.execute(f"DELETE FROM {table}")
+        for table, size in sizes.items():
+            self._populate(table, size)
+
+    def _assert_no_false_null(self, sql, expected=None):
+        inference = infer_nullability(
+            sql,
+            schema=self.SCHEMA,
+            not_null=self.NOT_NULL,
+            dialect=DIALECT,
+        )
+        if expected is not None:
+            self.assertEqual(expected, inference, msg=sql)
+        rows = self.conn.execute(sql).fetchall()
+        for row in rows:
+            self.assertEqual(len(row), len(inference), msg=sql)
+            for position, ((name, nullable), value) in enumerate(
+                zip(inference, row)
+            ):
+                if not nullable:
+                    self.assertIsNotNone(
+                        value,
+                        msg=(
+                            f"inferred non-NULL column {position} ('{name}') was "
+                            f"NULL in: {sql}\ninference={inference}"
+                        ),
+                    )
+
+    def test_handed_counterexamples_against_duckdb(self):
+        # Exercise each reported shape against several data layouts, including
+        # the exact small tables from the report.
+        layouts = [
+            # Exact report layout 1: a,b one matched row; c empty.
+            {"a": 0, "b": 0, "c": 0},
+        ]
+        for sql, expected in self.HANDED_EXPECTATIONS:
+            self._repopulate(a=0, b=0, c=0)
+            self.conn.execute("INSERT INTO a VALUES (1, NULL)")
+            self.conn.execute("INSERT INTO b VALUES (1, NULL)")
+            with self.subTest(layout="report-1", sql=sql):
+                self._assert_no_false_null(sql, expected)
+
+            self._repopulate(a=0, b=0, c=0)
+            self.conn.execute("INSERT INTO a VALUES (2, NULL)")
+            self.conn.execute("INSERT INTO c VALUES (9, 1)")
+            with self.subTest(layout="report-2", sql=sql):
+                self._assert_no_false_null(sql, expected)
+
+        # The report-1 layout genuinely yields the (1, NULL) result for q1.
+        self._repopulate(a=0, b=0, c=0)
+        self.conn.execute("INSERT INTO a VALUES (1, NULL)")
+        self.conn.execute("INSERT INTO b VALUES (1, NULL)")
+        q1 = self.HANDED_EXPECTATIONS[0][0]
+        self.assertEqual([(1, None)], self.conn.execute(q1).fetchall())
+
+        # And report-2 yields (NULL, 9) for q2.
+        self._repopulate(a=0, b=0, c=0)
+        self.conn.execute("INSERT INTO a VALUES (2, NULL)")
+        self.conn.execute("INSERT INTO c VALUES (9, 1)")
+        q2 = self.HANDED_EXPECTATIONS[1][0]
+        self.assertEqual([(None, 9)], self.conn.execute(q2).fetchall())
+
+    def test_nested_expression_where_against_duckdb(self):
+        # c is reachable from the preserved side, so c exists while b stays
+        # NULL-padded; the COALESCE predicate accepts that padded row.
+        self._repopulate(a=0, b=0, c=0)
+        self.conn.execute("INSERT INTO a VALUES (1, NULL)")
+        self.conn.execute("INSERT INTO c VALUES (0, 9)")
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id OR 1 = 1
+            WHERE COALESCE(b.id, 0) = c.id
+        """
+        inference = infer_nullability(
+            sql,
+            schema=self.SCHEMA,
+            not_null=self.NOT_NULL,
+            dialect=DIALECT,
+        )
+        self.assertEqual([("bid", True), ("cid", False)], inference)
+        self.assertEqual([(None, 0)], self.conn.execute(sql).fetchall())
+
+    def test_join_side_and_on_shape_matrix(self):
+        where_variants = [
+            "",
+            "WHERE b.id IS NOT NULL",
+            "WHERE c.id IS NOT NULL",
+            "WHERE b.v > 0",
+            "WHERE b.id IS NOT NULL OR c.id IS NOT NULL",
+            "WHERE b.id IS NOT NULL AND c.id IS NOT NULL",
+            # Nested-expression predicates: the outer expression is
+            # NULL-rejecting, but a column buried in COALESCE/arithmetic does
+            # not prove its source row is present.
+            "WHERE COALESCE(b.id, 0) = c.id",
+            "WHERE b.id + 1 = c.id",
+            "WHERE NOT (COALESCE(b.id, 0) IS NULL)",
+        ]
+        for side in self.JOIN_SIDES:
+            for on in self.ON_SHAPES:
+                on_c = on.replace("a.id = b.id", "b.id = c.id").replace(
+                    "a.v = b.v", "b.v = c.v"
+                ).replace("a.id = 2", "b.id = 2").replace(
+                    "COALESCE(a.id, 9)", "COALESCE(b.id, 9)"
+                ).replace("a.id IS NOT DISTINCT FROM b.id", "b.id IS NOT DISTINCT FROM c.id")
+                if side == "CROSS":
+                    join_b = "CROSS JOIN b"
+                    join_c = "CROSS JOIN c"
+                else:
+                    join_b = f"{side} JOIN b ON {on}"
+                    join_c = f"{side} JOIN c ON {on_c}"
+                for where in where_variants:
+                    sql = (
+                        "SELECT a.id AS aid, b.id AS bid, c.id AS cid "
+                        f"FROM a {join_b} {join_c} {where}"
+                    )
+                    with self.subTest(side=side, on=on, where=where):
+                        self._assert_no_false_null(sql)
+
+    def test_right_full_and_chain_directions(self):
+        queries = [
+            "SELECT a.id AS aid, b.id AS bid FROM a RIGHT JOIN b ON a.id = b.id",
+            "SELECT a.id AS aid, b.id AS bid FROM a FULL JOIN b ON a.id = b.id",
+            "SELECT a.id AS aid, b.id AS bid FROM a FULL JOIN b ON a.id = b.id "
+            "WHERE a.id IS NOT NULL",
+            """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            """,
+            """
+            SELECT a.id AS aid, b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON b.id = c.id
+            WHERE c.id IS NOT NULL
+            """,
+            # Reversed independent-join ordering, aligned by output names.
+            """
+            SELECT c.id AS cid, b.id AS bid
+            FROM a
+            LEFT JOIN c ON a.id = c.id
+            LEFT JOIN b ON a.id = b.id
+            WHERE b.id IS NOT NULL
+            """,
+        ]
+        for sql in queries:
+            with self.subTest(sql=sql):
+                self._assert_no_false_null(sql)
+
+    def test_cte_derived_and_alias_shadowing_execution(self):
+        queries = [
+            """
+            WITH d AS (
+                SELECT b.id AS bid, c.id AS cid
+                FROM a
+                LEFT JOIN b ON a.id = b.id
+                LEFT JOIN c ON b.id = c.id OR a.id = 2
+                WHERE c.id IS NOT NULL
+            )
+            SELECT bid, cid FROM d
+            """,
+            """
+            SELECT bid, cid FROM (
+                SELECT b.id AS bid, c.id AS cid
+                FROM a
+                LEFT JOIN b ON a.id = b.id
+                LEFT JOIN c ON a.id = c.id
+                WHERE b.id IS NOT NULL
+            ) d
+            """,
+            """
+            SELECT b.id AS outer_bid, d.x AS inner_bid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            JOIN (
+                SELECT b2.id AS x
+                FROM a AS a2
+                LEFT JOIN b AS b2 ON a2.id = b2.id
+                WHERE b2.id IS NOT NULL
+            ) d ON d.x = a.id
+            """,
+        ]
+        for sql in queries:
+            with self.subTest(sql=sql):
+                self._assert_no_false_null(sql)
+
+    def test_empty_tables_and_repeated_runs_are_stable(self):
+        # Fully empty fixture: outer joins still emit NULL-padded rows.
+        self._repopulate(a=0, b=0, c=0)
+        sql = """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id
+            WHERE b.id IS NOT NULL
+        """
+        first = infer_nullability(
+            sql, schema=self.SCHEMA, not_null=self.NOT_NULL, dialect=DIALECT
+        )
+        second = infer_nullability(
+            sql, schema=self.SCHEMA, not_null=self.NOT_NULL, dialect=DIALECT
+        )
+        self.assertEqual(first, second)
+        self.assertEqual([], self.conn.execute(sql).fetchall())
+
+        # Repopulate and confirm a non-NULL claim still never observes a NULL.
+        self._populate("a", 8)
+        self._populate("c", 8)  # b stays empty
+        self._assert_no_false_null(
+            """
+            SELECT b.id AS bid, c.id AS cid
+            FROM a
+            LEFT JOIN b ON a.id = b.id
+            LEFT JOIN c ON a.id = c.id
+            WHERE c.id IS NOT NULL
+            """
+        )
