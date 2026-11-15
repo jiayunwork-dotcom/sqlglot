@@ -1,3 +1,4 @@
+import collections
 import json
 import sys
 import tempfile
@@ -1029,14 +1030,18 @@ class TestOptimizer(unittest.TestCase):
             ("duckdb", "SELECT SUM(a) AS a FROM x ORDER BY SUM(a)"),
             (
                 "bigquery",
-                "WITH t AS (SELECT [STRUCT('a' AS email)] AS items) "
-                "SELECT (SELECT email FROM UNNEST(items)) FROM t",
+                (
+                    "WITH t AS (SELECT [STRUCT('a' AS email)] AS items) "
+                    "SELECT (SELECT email FROM UNNEST(items)) FROM t"
+                ),
             ),
             (
                 "clickhouse",
-                "WITH data AS (SELECT 1 AS id, 2 AS my_id, 'a' AS name, 'b' AS full_name) "
-                "SELECT id AS my_id, CONCAT(my_id, name) AS full_name FROM data "
-                "WHERE my_id = 1 GROUP BY my_id, full_name HAVING my_id = 1",
+                (
+                    "WITH data AS (SELECT 1 AS id, 2 AS my_id, 'a' AS name, 'b' AS full_name) "
+                    "SELECT id AS my_id, CONCAT(my_id, name) AS full_name FROM data "
+                    "WHERE my_id = 1 GROUP BY my_id, full_name HAVING my_id = 1"
+                ),
             ),
         ):
             with self.subTest(dialect=dialect, sql=sql):
@@ -2157,12 +2162,18 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
 
     def test_optimize_subqueries_in_join_on(self):
         for sql in (
-            "SELECT x.a, y.b FROM x LEFT JOIN y ON x.a = y.b "
-            "AND y.b IN (SELECT z.b FROM y AS z WHERE z.b = 2)",
-            "SELECT x.a, y.b FROM x JOIN y ON x.a = y.b "
-            "OR y.b IN (SELECT z.b FROM y AS z WHERE z.b > 100)",
-            "SELECT x.a, y.b FROM x LEFT JOIN y "
-            "ON y.b = (SELECT MAX(z.b) FROM y AS z WHERE z.b = x.a)",
+            (
+                "SELECT x.a, y.b FROM x LEFT JOIN y ON x.a = y.b "
+                "AND y.b IN (SELECT z.b FROM y AS z WHERE z.b = 2)"
+            ),
+            (
+                "SELECT x.a, y.b FROM x JOIN y ON x.a = y.b "
+                "OR y.b IN (SELECT z.b FROM y AS z WHERE z.b > 100)"
+            ),
+            (
+                "SELECT x.a, y.b FROM x LEFT JOIN y "
+                "ON y.b = (SELECT MAX(z.b) FROM y AS z WHERE z.b = x.a)"
+            ),
             "SELECT x.a, y.b FROM x LEFT JOIN y ON y.b = (SELECT MAX(z.b) FROM y AS z)",
         ):
             with self.subTest(sql=sql):
@@ -2275,13 +2286,19 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         for sql in (
             "SELECT a.id, b.id FROM a JOIN b NEAREST 1 BY DISTANCE ABS(a.id - b.id)",
             "SELECT a.id, b.id FROM a LEFT JOIN b NEAREST 1 BY DISTANCE ABS(a.id - b.id)",
-            "SELECT a.id, b.id FROM a JOIN b NEAREST 1 BY DISTANCE ABS(a.id - b.id) "
-            "JOIN c ON a.id = c.id AND b.id = c.id WHERE b.id > 1",
-            "SELECT a.id, b.id FROM a JOIN (SELECT id FROM b WHERE id > 1) AS b "
-            "NEAREST 1 BY DISTANCE ABS(a.id - b.id)",
+            (
+                "SELECT a.id, b.id FROM a JOIN b NEAREST 1 BY DISTANCE ABS(a.id - b.id) "
+                "JOIN c ON a.id = c.id AND b.id = c.id WHERE b.id > 1"
+            ),
+            (
+                "SELECT a.id, b.id FROM a JOIN (SELECT id FROM b WHERE id > 1) AS b "
+                "NEAREST 1 BY DISTANCE ABS(a.id - b.id)"
+            ),
             "SELECT a.id FROM a JOIN (SELECT 1 AS id) AS b NEAREST 1 BY DISTANCE ABS(a.id)",
-            "SELECT a.id, b.id FROM (SELECT id FROM a WHERE id > 1) AS a "
-            "JOIN b APPROX NEAREST 2 BY SIMILARITY a.id * b.id WHERE b.id > 1",
+            (
+                "SELECT a.id, b.id FROM (SELECT id FROM a WHERE id > 1) AS a "
+                "JOIN b APPROX NEAREST 2 BY SIMILARITY a.id * b.id WHERE b.id > 1"
+            ),
         ):
             for rule in (
                 optimizer.optimize_joins.optimize_joins,
@@ -2299,6 +2316,484 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
             optimizer.eliminate_joins.eliminate_joins,
             pretty=True,
         )
+
+    def test_eliminate_joins_safety(self):
+        """Type/collation-aware one-to-one proof for unused LEFT JOIN removal."""
+        from sqlglot.optimizer.eliminate_joins import eliminate_joins
+
+        def rule(sql, dialect, schema):
+            expression = qualify(parse_one(sql, dialect=dialect), schema=schema, dialect=dialect)
+            expression = annotate_types(expression, schema=schema, dialect=dialect)
+            return eliminate_joins(expression, dialect=dialect, schema=schema)
+
+        def eliminated(sql, dialect, schema):
+            return " JOIN " not in rule(sql, dialect, schema).sql(dialect).upper()
+
+        int_text_schema = {"l": {"k": "INTEGER"}, "r": {"k": "VARCHAR"}}
+        text_schema = {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+        int_schema = {"l": {"k": "INTEGER"}, "r": {"k": "INTEGER"}}
+        composite_schema = {
+            "l": {"a": "INTEGER", "b": "INTEGER"},
+            "r": {"a": "INTEGER", "b": "INTEGER"},
+        }
+
+        dangerous = [
+            (
+                "duckdb",
+                int_text_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                int_text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                    "ON l.k = CAST(q.k AS INT)"
+                ),
+            ),
+            (
+                "duckdb",
+                int_text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                    "ON CAST(l.k AS VARCHAR) = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                    "ON l.k COLLATE NOCASE = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT r.k FROM r GROUP BY r.k) q "
+                    "ON l.k COLLATE NOCASE = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "WITH q AS (SELECT DISTINCT r.k FROM r) "
+                    "SELECT l.k FROM l LEFT JOIN q ON l.k COLLATE NOCASE = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                    "ON l.k COLLATE RTRIM = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE NOCASE AS k FROM r) q "
+                    "ON l.k COLLATE RTRIM = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE RTRIM AS k FROM r) q "
+                    "ON l.k COLLATE NOCASE = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                    "ON l.k COLLATE CUSTOM = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                int_text_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                composite_schema,
+                "SELECT l.a FROM l LEFT JOIN (SELECT DISTINCT r.a, r.b FROM r) q ON l.a = q.a",
+            ),
+            (
+                "duckdb",
+                composite_schema,
+                (
+                    "SELECT l.a FROM l LEFT JOIN (SELECT DISTINCT r.a, r.b FROM r) q "
+                    "ON l.a = q.a OR l.b = q.b"
+                ),
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "DOUBLE"}, "r": {"k": "DECIMAL(5,2)"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "BOOLEAN"}, "r": {"k": "INTEGER"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "DATE"}, "r": {"k": "VARCHAR"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+        ]
+        for dialect, schema, sql in dangerous:
+            with self.subTest(sql=sql, dialect=dialect):
+                self.assertFalse(eliminated(sql, dialect, schema))
+
+        safe = [
+            (
+                "duckdb",
+                int_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "BIGINT"}, "r": {"k": "SMALLINT"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "DECIMAL(8,2)"}, "r": {"k": "DECIMAL(10,2)"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "DOUBLE"}, "r": {"k": "FLOAT"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "BOOLEAN"}, "r": {"k": "BOOLEAN"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "DATE"}, "r": {"k": "DATE"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "BLOB"}, "r": {"k": "VARBINARY"}},
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                text_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "sqlite",
+                text_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE NOCASE AS k FROM r) q "
+                    "ON l.k COLLATE NOCASE = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN "
+                    "(SELECT r.k COLLATE NOCASE AS k FROM r GROUP BY r.k COLLATE NOCASE) q "
+                    "ON l.k COLLATE NOCASE = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE RTRIM AS k FROM r) q "
+                    "ON l.k COLLATE RTRIM = q.k"
+                ),
+            ),
+            # BINARY is finer than NOCASE/RTRIM: it can't fan the join out
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE NOCASE AS k FROM r) q "
+                    "ON l.k = q.k"
+                ),
+            ),
+            (
+                "sqlite",
+                text_schema,
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE RTRIM AS k FROM r) q "
+                    "ON l.k COLLATE BINARY = q.k"
+                ),
+            ),
+            (
+                "duckdb",
+                composite_schema,
+                (
+                    "SELECT l.a FROM l LEFT JOIN (SELECT DISTINCT r.a, r.b FROM r) q "
+                    "ON l.a = q.a AND l.b = q.b"
+                ),
+            ),
+            (
+                "duckdb",
+                {"l": {"k": "INTEGER", "v": "INTEGER"}, "r": {"k": "INTEGER"}},
+                (
+                    "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                    "ON l.k = q.k AND q.k > 0 AND l.v > 1"
+                ),
+            ),
+            (
+                "duckdb",
+                composite_schema,
+                (
+                    "SELECT l.a FROM l LEFT JOIN (SELECT DISTINCT r.a, r.b FROM r) q "
+                    "ON (l.a = q.a AND l.b = q.b) OR (l.a = q.a AND l.b = q.b AND q.b > 0)"
+                ),
+            ),
+            (
+                "duckdb",
+                int_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT r.k FROM r GROUP BY r.k) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                int_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT r.k FROM r LIMIT 1) q ON l.k = q.k",
+            ),
+            (
+                "duckdb",
+                int_schema,
+                "SELECT l.k FROM l LEFT JOIN (SELECT MAX(r.k) AS k FROM r) q ON l.k = q.k",
+            ),
+        ]
+        for dialect, schema, sql in safe:
+            with self.subTest(sql=sql, dialect=dialect):
+                self.assertTrue(eliminated(sql, dialect, schema))
+
+    def test_eliminate_joins_forwarding_and_isolation(self):
+        from sqlglot.optimizer.eliminate_joins import _JoinEliminator, eliminate_joins
+
+        int_schema = {"l": {"k": "INTEGER"}, "r": {"k": "INTEGER"}}
+        mixed_schema = {"l": {"k": "INTEGER"}, "r": {"k": "VARCHAR"}}
+
+        def build(depth: int, mixed: bool) -> str:
+            inner = "(SELECT DISTINCT r.k FROM r)"
+            for i in range(depth):
+                inner = f"(SELECT t{i}.k FROM {inner} AS t{i})"
+            cast = "CAST(l.k AS VARCHAR) = " if mixed else "l.k = "
+            return f"SELECT l.k FROM l LEFT JOIN {inner} AS q ON {cast}q.k"
+
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(old_limit, 100000))
+        try:
+            for depth in (1, 10, 50, 100):
+                with self.subTest(depth=depth):
+                    safe_tree = annotate_types(
+                        qualify(
+                            parse_one(build(depth, False), dialect="duckdb"),
+                            schema=int_schema,
+                            dialect="duckdb",
+                        ),
+                        schema=int_schema,
+                        dialect="duckdb",
+                    )
+                    danger_tree = annotate_types(
+                        qualify(
+                            parse_one(build(depth, True), dialect="duckdb"),
+                            schema=mixed_schema,
+                            dialect="duckdb",
+                        ),
+                        schema=mixed_schema,
+                        dialect="duckdb",
+                    )
+                    self.assertNotIn(
+                        "JOIN",
+                        eliminate_joins(safe_tree.copy(), dialect="duckdb", schema=int_schema)
+                        .sql()
+                        .upper(),
+                    )
+                    self.assertIn(
+                        "LEFT JOIN",
+                        eliminate_joins(danger_tree.copy(), dialect="duckdb", schema=mixed_schema)
+                        .sql()
+                        .upper(),
+                    )
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+        shadow_sql = """
+            SELECT l.k FROM l LEFT JOIN (
+              SELECT s.k FROM (
+                SELECT t.k FROM (SELECT DISTINCT r.k AS k FROM r) AS t
+              ) AS s
+            ) AS q ON l.k = q.k
+        """
+        tree = annotate_types(
+            qualify(parse_one(shadow_sql, dialect="duckdb"), schema=int_schema, dialect="duckdb"),
+            schema=int_schema,
+            dialect="duckdb",
+        )
+        self.assertNotIn(
+            "JOIN", eliminate_joins(tree.copy(), dialect="duckdb", schema=int_schema).sql().upper()
+        )
+
+        # one shared CTE: safe join removed, dangerous join preserved, no leakage
+        shared_sql = """
+            WITH q AS (SELECT DISTINCT r.k FROM r)
+            SELECT l.k FROM l
+            LEFT JOIN q AS q1 ON l.k = q1.k
+            LEFT JOIN q AS q2 ON CAST(l.k AS VARCHAR) = q2.k
+        """
+        tree = annotate_types(
+            qualify(parse_one(shared_sql, dialect="duckdb"), schema=int_schema, dialect="duckdb"),
+            schema=int_schema,
+            dialect="duckdb",
+        )
+        output = eliminate_joins(tree.copy(), dialect="duckdb", schema=int_schema).sql("duckdb")
+        self.assertEqual(1, output.upper().count("LEFT JOIN"))
+        self.assertIn("q2", output)
+
+        # uniqueness analysis of a shared scope is memoized per call only
+        analyzer = _JoinEliminator(tree, dialect="duckdb", schema=int_schema)
+        cte_scope = next(s for s in traverse_scope(tree) if s.scope_type.name == "CTE")
+        first = analyzer._unique_outputs(cte_scope)
+        self.assertIs(first, analyzer._unique_outputs(cte_scope))
+
+        # bare rule call keeps the historical signature and in-place convention
+        expression = parse_one(
+            "SELECT x.a FROM x LEFT JOIN (SELECT DISTINCT y.b FROM y) AS y ON x.b = y.b"
+        )
+        self.assertIs(expression, eliminate_joins(expression))
+        self.assertEqual("SELECT x.a FROM x", expression.sql())
+
+        # optimize(copy=True) must not mutate caller types or structure
+        sql = "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k"
+        caller = qualify(parse_one(sql, dialect="duckdb"), schema=mixed_schema, dialect="duckdb")
+        snapshot = caller.copy()
+        optimizer.optimize(caller, schema=mixed_schema, dialect="duckdb")
+        self.assertEqual(snapshot, caller)
+        self.assertTrue(all(column.type is None for column in caller.find_all(exp.Column)))
+
+    def test_eliminate_joins_engine_multisets(self):
+        """Full row multiset + column name checks in DuckDB and SQLite."""
+        import sqlite3
+
+        def multiset(columns, rows):
+            return columns, collections.Counter(tuple(row) for row in rows)
+
+        def run_duckdb(sql, setup, schema):
+            connection = duckdb.connect()
+            for statement in setup:
+                connection.execute(statement)
+            optimized = optimizer.optimize(sql, schema=schema, dialect="duckdb").sql("duckdb")
+            cursor = connection.execute(sql)
+            expected = multiset([d[0] for d in cursor.description], cursor.fetchall())
+            cursor = connection.execute(optimized)
+            actual = multiset([d[0] for d in cursor.description], cursor.fetchall())
+            return expected, actual, optimized
+
+        def run_sqlite(sql, setup, schema):
+            connection = sqlite3.connect(":memory:")
+            connection.executescript(";\n".join(setup))
+            optimized = optimizer.optimize(sql, schema=schema, dialect="sqlite").sql("sqlite")
+            cursor = connection.execute(sql)
+            expected = multiset([d[0] for d in cursor.description], cursor.fetchall())
+            cursor = connection.execute(optimized)
+            actual = multiset([d[0] for d in cursor.description], cursor.fetchall())
+            return expected, actual, optimized
+
+        expected, actual, optimized = run_duckdb(
+            "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k",
+            [
+                "CREATE TABLE l(k INTEGER); INSERT INTO l VALUES (1),(2)",
+                "CREATE TABLE r(k VARCHAR); INSERT INTO r VALUES ('1'),('01'),('2')",
+            ],
+            {"l": {"k": "INTEGER"}, "r": {"k": "VARCHAR"}},
+        )
+        self.assertEqual(expected, actual)
+        self.assertIn("LEFT JOIN", optimized.upper())
+        self.assertEqual(collections.Counter({(1,): 2, (2,): 1}), actual[1])
+
+        expected, actual, optimized = run_duckdb(
+            "SELECT l.k AS kk FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q ON l.k = q.k "
+            "ORDER BY l.k DESC LIMIT 2",
+            [
+                "CREATE TABLE l(k INTEGER); INSERT INTO l VALUES (3),(1),(2),(1)",
+                "CREATE TABLE r(k INTEGER); INSERT INTO r VALUES (1),(2),(3)",
+            ],
+            {"l": {"k": "INTEGER"}, "r": {"k": "INTEGER"}},
+        )
+        self.assertEqual(expected, actual)
+        self.assertNotIn("JOIN", optimized.upper())
+
+        setup = [
+            "CREATE TABLE l(k TEXT)",
+            "INSERT INTO l VALUES ('a')",
+            "CREATE TABLE r(k TEXT)",
+            "INSERT INTO r VALUES ('a'),('A')",
+        ]
+        for sql in (
+            (
+                "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) q "
+                "ON l.k COLLATE NOCASE = q.k"
+            ),
+            (
+                "SELECT l.k FROM l LEFT JOIN (SELECT r.k FROM r GROUP BY r.k) q "
+                "ON l.k COLLATE NOCASE = q.k"
+            ),
+            (
+                "WITH q AS (SELECT DISTINCT r.k FROM r) "
+                "SELECT l.k FROM l LEFT JOIN q ON l.k COLLATE NOCASE = q.k"
+            ),
+        ):
+            with self.subTest(sql=sql):
+                expected, actual, optimized = run_sqlite(
+                    sql, setup, {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+                )
+                self.assertEqual(expected, actual)
+                self.assertIn("LEFT JOIN", optimized.upper())
+                self.assertEqual(collections.Counter({("a",): 2}), actual[1])
+
+        expected, actual, optimized = run_sqlite(
+            "SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE NOCASE AS k FROM r) q "
+            "ON l.k COLLATE NOCASE = q.k",
+            setup,
+            {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}},
+        )
+        self.assertEqual(expected, actual)
+        self.assertNotIn("JOIN", optimized.upper())
+
+        empty_setup = [
+            "CREATE TABLE l(k TEXT)",
+            "INSERT INTO l VALUES ('a'),('a'),(NULL)",
+            "CREATE TABLE r1(k TEXT)",
+            "INSERT INTO r1 VALUES ('a')",
+            "CREATE TABLE r2(k TEXT)",
+        ]
+        expected, actual, optimized = run_sqlite(
+            "SELECT l.k FROM l "
+            "LEFT JOIN (SELECT DISTINCT r1.k FROM r1) q1 ON l.k = q1.k "
+            "LEFT JOIN (SELECT DISTINCT r2.k FROM r2) q2 ON l.k = q2.k "
+            "ORDER BY l.k",
+            empty_setup,
+            {"l": {"k": "TEXT"}, "r1": {"k": "TEXT"}, "r2": {"k": "TEXT"}},
+        )
+        self.assertEqual(expected, actual)
 
     def test_eliminate_ctes(self):
         self.check_file(
@@ -3105,8 +3600,10 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
                 "STRUCT<x INT, y VARCHAR>",
             ),
             (
-                "SELECT r FROM (SELECT 1 AS x UNION ALL "
-                "(SELECT 2 AS x UNION ALL SELECT CAST(3 AS DOUBLE) AS x)) AS r",
+                (
+                    "SELECT r FROM (SELECT 1 AS x UNION ALL "
+                    "(SELECT 2 AS x UNION ALL SELECT CAST(3 AS DOUBLE) AS x)) AS r"
+                ),
                 "STRUCT<x DOUBLE>",
             ),
             ("SELECT (SELECT 1 AS x)", "INT"),
@@ -4013,12 +4510,18 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
 
     def test_duplicate_set_operation_projections(self):
         for sql in (
-            "SELECT t.a, t.b FROM (SELECT 1 AS a, 2 AS b UNION ALL "
-            "SELECT 3 AS x, CAST(4.5 AS DOUBLE) AS x) AS t",
-            "SELECT t.a, t.b FROM (SELECT 1 AS a, 2 AS b UNION ALL "
-            "(SELECT 3 AS c, 4 AS c UNION ALL SELECT 5, CAST(6.5 AS DOUBLE))) AS t",
-            "SELECT t.a, t.b FROM (SELECT 1 AS a, CAST(2.5 AS DOUBLE) AS b "
-            "UNION ALL SELECT 0, 0) AS t",
+            (
+                "SELECT t.a, t.b FROM (SELECT 1 AS a, 2 AS b UNION ALL "
+                "SELECT 3 AS x, CAST(4.5 AS DOUBLE) AS x) AS t"
+            ),
+            (
+                "SELECT t.a, t.b FROM (SELECT 1 AS a, 2 AS b UNION ALL "
+                "(SELECT 3 AS c, 4 AS c UNION ALL SELECT 5, CAST(6.5 AS DOUBLE))) AS t"
+            ),
+            (
+                "SELECT t.a, t.b FROM (SELECT 1 AS a, CAST(2.5 AS DOUBLE) AS b "
+                "UNION ALL SELECT 0, 0) AS t"
+            ),
         ):
             for qualified in (False, True):
                 with self.subTest(sql=sql, qualified=qualified):

@@ -670,3 +670,149 @@ LEFT JOIN (
   ON TRY_CAST(y.b AS INT) = x.a
 ORDER BY
   x.a;
+
+# title: Preserve left join across integer/text type families (DuckDB)
+# dialect: duckdb
+# schema: {"l": {"k": "INTEGER"}, "r": {"k": "VARCHAR"}}
+SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) AS q ON l.k = q.k;
+SELECT
+  l.k
+FROM l
+LEFT JOIN (
+  SELECT DISTINCT
+    r.k
+  FROM r
+) AS q
+  ON l.k = q.k;
+
+# title: Preserve left join when NOCASE collation coarsens BINARY-deduped text (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) AS q ON l.k COLLATE NOCASE = q.k;
+SELECT
+  l.k
+FROM l
+LEFT JOIN (
+  SELECT DISTINCT
+    r.k
+  FROM r
+) AS q
+  ON l.k COLLATE NOCASE = q.k;
+
+# title: Preserve NOCASE left join on grouped right side (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+SELECT l.k FROM l LEFT JOIN (SELECT r.k FROM r GROUP BY r.k) AS q ON l.k COLLATE NOCASE = q.k;
+SELECT
+  l.k
+FROM l
+LEFT JOIN (
+  SELECT
+    r.k
+  FROM r
+  GROUP BY
+    r.k
+) AS q
+  ON l.k COLLATE NOCASE = q.k;
+
+# title: Preserve NOCASE left join on CTE right side (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+WITH q AS (SELECT DISTINCT r.k FROM r) SELECT l.k FROM l LEFT JOIN q ON l.k COLLATE NOCASE = q.k;
+WITH q AS (
+  SELECT DISTINCT
+    r.k
+  FROM r
+)
+SELECT
+  l.k
+FROM l
+LEFT JOIN q
+  ON l.k COLLATE NOCASE = q.k;
+
+# title: Remove NOCASE left join on NOCASE-deduped right side (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE NOCASE AS k FROM r) AS q ON l.k COLLATE NOCASE = q.k;
+SELECT
+  l.k
+FROM l;
+
+# title: Remove NOCASE left join on NOCASE-grouped right side (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+SELECT l.k FROM l LEFT JOIN (SELECT r.k COLLATE NOCASE AS k FROM r GROUP BY r.k COLLATE NOCASE) AS q ON l.k COLLATE NOCASE = q.k;
+SELECT
+  l.k
+FROM l;
+
+# title: Preserve left join when RTRIM collation coarsens BINARY-deduped text (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k FROM r) AS q ON l.k COLLATE RTRIM = q.k;
+SELECT
+  l.k
+FROM l
+LEFT JOIN (
+  SELECT DISTINCT
+    r.k
+  FROM r
+) AS q
+  ON l.k COLLATE RTRIM = q.k;
+
+# title: Remove RTRIM left join on RTRIM-deduped right side (SQLite)
+# dialect: sqlite
+# schema: {"l": {"k": "TEXT"}, "r": {"k": "TEXT"}}
+SELECT l.k FROM l LEFT JOIN (SELECT DISTINCT r.k COLLATE RTRIM AS k FROM r) AS q ON l.k COLLATE RTRIM = q.k;
+SELECT
+  l.k
+FROM l;
+
+# title: Remove integer left join through forwarding derived tables
+# dialect: duckdb
+# schema: {"l": {"k": "INTEGER"}, "r": {"k": "INTEGER"}}
+SELECT l.k FROM l LEFT JOIN (SELECT t.k FROM (SELECT DISTINCT r.k FROM r) AS t) AS q ON l.k = q.k;
+SELECT
+  l.k
+FROM l;
+
+# title: Preserve mixed-type left join through forwarding derived tables
+# dialect: duckdb
+# schema: {"l": {"k": "INTEGER"}, "r": {"k": "VARCHAR"}}
+SELECT l.k FROM l LEFT JOIN (SELECT t.k FROM (SELECT DISTINCT r.k FROM r) AS t) AS q ON l.k = q.k;
+SELECT
+  l.k
+FROM l
+LEFT JOIN (
+  SELECT
+    t.k
+  FROM (
+    SELECT DISTINCT
+      r.k
+    FROM r
+  ) AS t
+) AS q
+  ON l.k = q.k;
+
+# title: Remove safe left join repeated across OR disjuncts
+# dialect: duckdb
+# schema: {"l": {"a": "INTEGER", "b": "INTEGER"}, "r": {"a": "INTEGER", "b": "INTEGER"}}
+SELECT l.a FROM l LEFT JOIN (SELECT DISTINCT r.a, r.b FROM r) AS q ON (l.a = q.a AND l.b = q.b) OR (l.a = q.a AND l.b = q.b AND q.b > 0);
+SELECT
+  l.a
+FROM l;
+
+# title: Preserve left join when OR disjuncts use different keys
+# dialect: duckdb
+# schema: {"l": {"a": "INTEGER", "b": "INTEGER"}, "r": {"a": "INTEGER", "b": "INTEGER"}}
+SELECT l.a FROM l LEFT JOIN (SELECT DISTINCT r.a, r.b FROM r) AS q ON l.a = q.a OR l.b = q.b;
+SELECT
+  l.a
+FROM l
+LEFT JOIN (
+  SELECT DISTINCT
+    r.a,
+    r.b
+  FROM r
+) AS q
+  ON l.a = q.a OR l.b = q.b;
