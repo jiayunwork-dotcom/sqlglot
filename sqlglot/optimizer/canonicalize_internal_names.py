@@ -106,10 +106,22 @@ def canonicalize_internal_names(expression: E) -> E:
                 child_output: dict[str, str] = {}
                 name_map: dict[str, str] = table_columns.setdefault(id(source), {})
             elif isinstance(source, Scope):
-                # Key by id(expression) so a recursive CTE's self-reference, i.e., a separate
+                # A recursive CTE's self-reference resolves to the scope of its full
+                # UNION ALL body. Its columns carry the relation's own identity, whose
+                # canonical names are the anchor branch's output names, so resolve through
+                # the first set-operation arm instead of the (not yet built) union output.
+                relation = source.recursive_relation
+                if (
+                    relation is not None
+                    and source is relation.scope
+                    and scope is relation.recursive_scope
+                ):
+                    src_expr = relation.anchor_scope.expression
+                else:
+                    src_expr = source.expression
+                # Key by id(expression) so a recursive CTE's self-reference, i.e. a separate
                 # Scope whose `expression` is the same object as the CTE's base branch, shares
                 # the base branch's output mapping.
-                src_expr = source.expression
                 child_output = scope_outputs.get(id(src_expr), {})
 
                 parent = src_expr.parent

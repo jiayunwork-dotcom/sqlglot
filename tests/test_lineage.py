@@ -1379,3 +1379,169 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+
+class TestRecursiveLineage(unittest.TestCase):
+    maxDiff = None
+
+    SCHEMA = {
+        "seed": {"x": "INTEGER", "y": "INTEGER", "z": "INTEGER"},
+        "extra": {"id": "INTEGER", "delta": "INTEGER"},
+    }
+
+    RECURSIVE_SQL = """
+        WITH RECURSIVE r(a,b,n,dead) AS (
+          SELECT x,y,0,z FROM seed
+          UNION ALL
+          SELECT r.b,r.a+e.delta,r.n+1,r.dead
+          FROM r JOIN extra e ON e.id=r.n WHERE r.n<3
+        )
+        SELECT a FROM r
+    """
+
+    def _table_columns(self, node):
+        return sorted(
+            {
+                (n.expression.name, n.name.split(".")[-1])
+                for n in node.walk()
+                if isinstance(n.expression, sqlglot.exp.Table)
+            }
+        )
+
+    def test_recursive_value_sources_include_later_terms(self):
+        node = lineage("a", self.RECURSIVE_SQL, schema=self.SCHEMA, dialect="sqlite")
+
+        # a swaps with b, and b folds in extra.delta on later iterations
+        self.assertEqual(
+            self._table_columns(node),
+            [("extra", "delta"), ("seed", "x"), ("seed", "y")],
+        )
+
+    def test_recursive_predicate_columns_are_not_value_sources(self):
+        node = lineage("a", self.RECURSIVE_SQL, schema=self.SCHEMA, dialect="sqlite")
+        names = {col for _, col in self._table_columns(node)}
+
+        # extra.id and the control column n only shape rows (ON / WHERE), not values
+        self.assertNotIn("id", names)
+        self.assertNotIn("n", names)
+
+    def test_recursive_graph_is_finite_and_keeps_the_cycle(self):
+        node = lineage("a", self.RECURSIVE_SQL, schema=self.SCHEMA, dialect="sqlite")
+
+        walked = list(node.walk())
+        self.assertEqual(len(walked), len({id(n) for n in walked}))
+        self.assertTrue(walked)
+
+        # The recursive term for b reads r.a, which must point back at the
+        # already-created relation node instead of restarting the walk.
+        relation_nodes = [n for n in walked if n.name == "r.a"]
+        self.assertEqual(len(relation_nodes), 1)
+        recursive_b = next(n for n in walked if n.name == "r.b@recursive")
+        self.assertIn(relation_nodes[0], recursive_b.downstream)
+
+        # to_html shares the same terminating traversal
+        html = node.to_html()
+        self.assertEqual(len(html.nodes), len(walked))
+
+    def test_recursive_lineage_all_outputs(self):
+        result = lineage(None, self.RECURSIVE_SQL, schema=self.SCHEMA, dialect="sqlite")
+        self.assertEqual(set(result), {"a"})
+        node = result["a"]
+        self.assertEqual(
+            self._table_columns(node),
+            [("extra", "delta"), ("seed", "x"), ("seed", "y")],
+        )
+
+    def test_recursive_on_node_fires_once_per_created_node(self):
+        created = []
+        node = lineage(
+            "a",
+            self.RECURSIVE_SQL,
+            schema=self.SCHEMA,
+            dialect="sqlite",
+            on_node=created.append,
+        )
+        walked = list(node.walk())
+        self.assertEqual(len(created), len(walked))
+        self.assertEqual({id(n) for n in created}, {id(n) for n in walked})
+
+    def test_recursive_lineage_with_prebuilt_scope_matches_sql_entry(self):
+        from sqlglot.optimizer import build_scope, qualify
+
+        qualified = qualify.qualify(
+            sqlglot.parse_one(self.RECURSIVE_SQL, dialect="sqlite"),
+            schema=self.SCHEMA,
+            dialect="sqlite",
+            identify=False,
+            validate_qualify_columns=False,
+        )
+        scope = build_scope(qualified)
+        via_scope = lineage("a", qualified, schema=self.SCHEMA, dialect="sqlite", scope=scope)
+        via_sql = lineage("a", self.RECURSIVE_SQL, schema=self.SCHEMA, dialect="sqlite")
+        self.assertEqual(self._table_columns(via_scope), self._table_columns(via_sql))
+
+    def test_recursive_only_later_source(self):
+        sql = """
+            WITH RECURSIVE r(a,b) AS (
+              SELECT x, 0 FROM seed
+              UNION ALL
+              SELECT r.a + e.delta, r.b + 1 FROM r JOIN extra e ON e.id = r.b
+            )
+            SELECT a FROM r
+        """
+        node = lineage("a", sql, schema=self.SCHEMA, dialect="sqlite")
+        self.assertEqual(
+            self._table_columns(node),
+            [("extra", "delta"), ("seed", "x")],
+        )
+
+    def test_recursive_multi_column_swap(self):
+        sql = """
+            WITH RECURSIVE r(a,b,c) AS (
+              SELECT x, y, z FROM seed
+              UNION ALL
+              SELECT r.c, r.a, r.b FROM r WHERE r.a < 2
+            )
+            SELECT a FROM r
+        """
+        node = lineage("a", sql, schema=self.SCHEMA, dialect="sqlite")
+        self.assertEqual(
+            self._table_columns(node),
+            [("seed", "x"), ("seed", "y"), ("seed", "z")],
+        )
+
+    def test_recursive_shadowing_keeps_bindings_distinct(self):
+        schema = {"kv": {"k": "INTEGER", "v": "INTEGER"}}
+        sql = """
+            WITH RECURSIVE r(x) AS (
+              SELECT k FROM kv
+              UNION ALL
+              SELECT r.x + 1 FROM r WHERE r.x < 2
+            )
+            SELECT s.x FROM (
+              WITH RECURSIVE r(x) AS (
+                SELECT v FROM kv
+                UNION ALL
+                SELECT r.x + 2 FROM r WHERE r.x < 2
+              )
+              SELECT x FROM r
+            ) AS s
+        """
+        node = lineage("x", sql, schema=schema, dialect="sqlite")
+        self.assertEqual(self._table_columns(node), [("kv", "v")])
+
+    def test_recursive_unsupported_shape_lineage_stays_finite(self):
+        schema = {"t": {"a": "INT", "b": "INT"}}
+        # UNION DISTINCT is outside the fixed-point support; lineage must still
+        # terminate with a conservative (anchor-based) graph.
+        sql = (
+            "WITH RECURSIVE r(a,b) AS ("
+            "SELECT a,b FROM t "
+            "UNION "
+            "SELECT r.b, r.a FROM r WHERE r.a < 2) SELECT a FROM r"
+        )
+        node = lineage("a", sql, schema=schema, dialect="sqlite")
+        walked = list(node.walk())
+        self.assertEqual(len(walked), len({id(n) for n in walked}))
+        html = node.to_html()
+        self.assertEqual(len(html.nodes), len(walked))

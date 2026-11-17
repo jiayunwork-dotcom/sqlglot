@@ -8,7 +8,12 @@ from sqlglot.errors import OptimizeError
 from sqlglot.helper import seq_get
 from sqlglot.optimizer.helpers import is_implicit_group_by_all, projection_has_aggregate
 from sqlglot.optimizer.journal import Journal, record
-from sqlglot.optimizer.scope import Scope, find_all_in_scope, traverse_scope
+from sqlglot.optimizer.recursive import RecursiveFlow
+from sqlglot.optimizer.scope import (
+    Scope,
+    find_all_in_scope,
+    traverse_scope,
+)
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
@@ -67,6 +72,9 @@ class ProjectionReachability(t.NamedTuple):
 
     # Set-operation scope -> output names before either operand is pruned
     set_names: dict[Scope, list[str]]
+
+    # Supported recursive relation scopes paired with their finite flow summaries
+    recursive_relations: list[tuple[Scope, RecursiveFlow]] = []
 
 
 class DependencyNode:
@@ -226,12 +234,21 @@ def projection_reachability(
         scope_node = scope_nodes[scope]
         outputs = output_nodes[scope]
         order = query.args.get("order")
+        relation = scope.recursive_relation
+        supported_recursive = bool(
+            relation and relation.supported and isinstance(query, exp.SetOperation)
+        )
         keep_all = bool(
             query.args.get("distinct")
             or isinstance(query, (exp.Intersect, exp.Except))
-            or _is_self_referencing_cte(scope)
+            or (_is_self_referencing_cte(scope) and not supported_recursive)
             or not isinstance(query, (exp.Select, exp.SetOperation))
         )
+        recursive_flow: RecursiveFlow | None = None
+        if relation is not None and relation.supported:
+            # The same finite flow is reused by the union scope and both arms, so the
+            # recursive analysis is computed once per relation regardless of references.
+            recursive_flow = relation.flow
 
         # The containing expression requires the subquery's scope node and all its outputs.
         for child in scope.subquery_scopes:
@@ -258,20 +275,65 @@ def projection_reachability(
             if not by_name and len(output_nodes[left]) != len(output_nodes[right]):
                 raise OptimizeError(f"Invalid set operation due to column mismatch: {query.sql()}.")
 
-            # Match outputs by name for BY NAME, otherwise by position. A retained output
-            # requires its matching branch outputs. Reverse edges propagate columns required
-            # within a branch (e.g. by ORDER BY) back to the set operation and matching outputs
-            # in the other branch, preserving the combined schema.
-            for branch in (left, right):
-                for i, output_node in enumerate(output_nodes[branch]):
-                    targets = (
-                        outputs_by_name[scope].get(output_names[branch][i], [])
-                        if by_name
-                        else [outputs[i]]
+            if supported_recursive and recursive_flow is not None:
+                # A recursive UNION ALL gets fixed-point edges instead of the generic
+                # bidirectional set-operation edges: retained output i requires the anchor
+                # projection i plus the recursive-term projections feeding it through the
+                # relation's own column swaps. The fixpoint closure below then adds every
+                # column needed for value transfer and row conditions.
+                def add_external(
+                    owner_node: DependencyNode, arm: Scope, key: tuple[str, str]
+                ) -> None:
+                    table, column_name = key
+                    external_source = (
+                        scopes_by_expression.get(id(arm.sources[table].expression))
+                        if isinstance(arm.sources.get(table), Scope)
+                        else None
                     )
-                    for output in targets:
-                        output.dependencies.append(output_node)
-                        output_node.dependencies.append(output)
+                    if external_source is not None:
+                        for target in outputs_by_name[external_source].get(column_name, []):
+                            owner_node.dependencies.append(target)
+
+                consumed_by_other: set[int] = set()
+                for i, producers in enumerate(recursive_flow.recursive_inputs):
+                    for producer in producers:
+                        if producer != i:
+                            consumed_by_other.add(producer)
+
+                for i in range(len(outputs)):
+                    union_output = outputs[i]
+                    union_output.dependencies.append(output_nodes[left][i])
+                    for producer in recursive_flow.recursive_inputs[i]:
+                        # Pure self-loop columns with no other role have no information flow
+                        # into anything retained, so don't pin their recursive projection.
+                        if (
+                            producer == i
+                            and i not in consumed_by_other
+                            and i not in recursive_flow.predicate_recursive
+                            and not recursive_flow.anchor_inputs[i]
+                            and not recursive_flow.recursive_external[i]
+                        ):
+                            continue
+                        union_output.dependencies.append(output_nodes[right][producer])
+                    for key in recursive_flow.anchor_inputs[i]:
+                        add_external(union_output, left, key)
+                    for key in recursive_flow.recursive_external[i]:
+                        add_external(union_output, right, key)
+            else:
+                # Match outputs by name for BY NAME, otherwise by position. A retained output
+                # requires its matching branch outputs. Reverse edges propagate columns required
+                # within a branch (e.g. by ORDER BY) back to the set operation and matching outputs
+                # in the other branch, preserving the combined schema.
+                for branch in (left, right):
+                    for i, output_node in enumerate(output_nodes[branch]):
+                        targets = (
+                            outputs_by_name[scope].get(output_names[branch][i], [])
+                            if by_name
+                            else [outputs[i]]
+                        )
+                        for output in targets:
+                            output.dependencies.append(output_node)
+                            output_node.dependencies.append(output)
 
         if keep_all:
             scope_node.dependencies.extend(outputs)
@@ -290,7 +352,11 @@ def projection_reachability(
         for name in _output_column_refs(query, scoped=not isinstance(query, exp.Select)):
             scope_node.dependencies.extend(outputs_by_name[scope].get(name, []))
 
-        scope_node.dependencies.extend(outputs[: len(scope.outer_columns)])
+        # The outer column list of a recursive relation (and of either of its arms) is
+        # rewritten alongside the projections during pruning, so it is exempt here; every
+        # other positional column list pins the width of the source.
+        if recursive_flow is None:
+            scope_node.dependencies.extend(outputs[: len(scope.outer_columns)])
 
         if isinstance(query, exp.Select):
             windows = query.args.get("windows")
@@ -331,7 +397,19 @@ def projection_reachability(
 
             # Recursive references can use a second Scope object for the same expression.
             source = scopes_by_expression[id(source.expression)]
-            scope_node.dependencies.append(scope_nodes[source])
+
+            # A recursive arm's reference to its own relation is modeled by the fixed-point
+            # edges above; treating it as an ordinary scope dependency would mark every
+            # relation column live and defeat pruning.
+            recursive_self_ref = False
+            if recursive_flow is not None and name == recursive_flow.relation.name:
+                relation_scope = recursive_flow.relation.scope
+                recursive_self_ref = source is relation_scope and (
+                    scope is relation_scope or scope in relation_scope.set_operation_scopes
+                )
+
+            if not recursive_self_ref:
+                scope_node.dependencies.append(scope_nodes[source])
             source_outputs = output_nodes[source]
             first = (
                 seq_get(source.expression.selects, 0)
@@ -347,10 +425,25 @@ def projection_reachability(
             ):
                 scope_node.dependencies.extend(source_outputs)
 
-            # Column alias lists bind by position, so keep every projection they name.
-            scope_node.dependencies.extend(source_outputs[: len(reference.alias_column_names)])
+            # Column alias lists bind by position and pin the full width of ordinary
+            # sources. A recursive relation's explicit column list is rewritten together
+            # with its arms during pruning, so it must not force every relation column live.
+            if not (recursive_self_ref and recursive_flow is not None):
+                scope_node.dependencies.extend(source_outputs[: len(reference.alias_column_names)])
 
         for col in scope.columns:
+            # Self-references inside a recursive arm are modeled by the fixed-point edges
+            # below; the generic column loop would route them through the whole relation
+            # scope and keep every column, including pure self-loop dead columns.
+            if (
+                recursive_flow is not None
+                and col.table == recursive_flow.relation.name
+                and (
+                    scope is recursive_flow.relation.scope
+                    or scope in recursive_flow.relation.scope.set_operation_scopes
+                )
+            ):
+                continue
             source = scope.sources.get(col.table or col.name)
             if isinstance(source, Scope):
                 source = scopes_by_expression[id(source.expression)]
@@ -363,6 +456,23 @@ def projection_reachability(
             if isinstance(source, Scope):
                 source = scopes_by_expression[id(source.expression)]
                 owner(table_column).dependencies.extend(output_nodes[source])
+
+        if supported_recursive and recursive_flow is not None:
+            # Recursive relations are decided by one finite flow summary instead of the
+            # generic scope/column edges above (which cannot distinguish a dead self-loop
+            # from a live value swap). The required set closes over every retained output,
+            # the recursive value swaps feeding them, and every WHERE / ON condition.
+            for i in range(len(outputs)):
+                if i in recursive_flow.predicate_recursive:
+                    scope_nodes[right].dependencies.append(output_nodes[right][i])
+
+            for table, column_name in recursive_flow.condition_external:
+                condition_source = right.sources.get(table)
+                if isinstance(condition_source, Scope):
+                    condition_source = scopes_by_expression[id(condition_source.expression)]
+                    scope_nodes[right].dependencies.extend(
+                        outputs_by_name[condition_source].get(column_name, [])
+                    )
 
     # DML/DDL can have several independent queries and CTEs referenced outside any query.
     roots = (
@@ -397,11 +507,33 @@ def projection_reachability(
     live = {}
     selections = {}
     set_names = {}
+    recursive_relations: list[tuple[Scope, RecursiveFlow]] = []
     for scope in scopes:
         live[scope] = scope_nodes[scope].required_by
         selections[scope] = [output_node.required_by for output_node in output_nodes[scope]]
         if isinstance(scope.expression, exp.SetOperation):
             set_names[scope] = scope.expression.named_selects
+        relation = scope.recursive_relation
+        if (
+            relation is not None
+            and relation.supported
+            and isinstance(scope.expression, exp.SetOperation)
+        ):
+            recursive_relations.append((scope, relation.flow))
+
+    # Recursive relations get an authoritative liveness decision from their finite flow
+    # summary. The fixpoint tells which relation outputs are reachable from the query;
+    # required_columns then adds every value-swap producer and row-condition column, and
+    # applies the same bits to the union and both arms so their widths never diverge.
+    for union_scope, flow in recursive_relations:
+        anchor_scope, recursive_scope = union_scope.set_operation_scopes
+        reachable = [i for i, bit in enumerate(selections[union_scope]) if bit]
+        required = flow.required_columns(reachable)
+        width = len(selections[union_scope])
+        bits = [1 if i in required else 0 for i in range(width)]
+        selections[union_scope] = list(bits)
+        selections[anchor_scope] = list(bits)
+        selections[recursive_scope] = list(bits)
 
     return ProjectionReachability(
         scopes=scopes,
@@ -410,6 +542,7 @@ def projection_reachability(
         is_agg=is_agg,
         group_by_ordinals=group_by_ordinals,
         set_names=set_names,
+        recursive_relations=recursive_relations,
     )
 
 
@@ -507,6 +640,54 @@ def prune_projections(
                         record(journal, node, "this")
 
                     node.set("this", str(pos))
+
+    _prune_recursive_cte_columns(reachability, bit, journal)
+
+    # Projection lists were rewritten in place. Invalidate every cached flow reachable
+    # from this scope tree, including flows attached to bindings built by an earlier
+    # traversal (the reachability analysis itself constructs fresh scopes). The holder
+    # lives on the shared CTE node, so clearing it invalidates older bindings too and
+    # ensures a later analysis never reads dependencies over stale column positions.
+    invalidated: set[int] = set()
+    for scope in reachability.scopes:
+        relation = scope.recursive_relation
+        if relation is not None and id(relation) not in invalidated:
+            relation.invalidate_flow()
+            invalidated.add(id(relation))
+
+
+def _prune_recursive_cte_columns(
+    reachability: ProjectionReachability,
+    bit: int,
+    journal: Journal | None,
+) -> None:
+    """Rewrite each recursive CTE's explicit column list to its retained width.
+
+    Projection pruning already shortened both arms in lockstep; this keeps the CTE's
+    positional alias list in sync, so a later qualify / build_scope / lineage pass sees
+    the remaining columns at their real positions instead of stale cached positions.
+    """
+    for union_scope, flow in reachability.recursive_relations:
+        cte = flow.relation.cte
+        table_alias = cte.args.get("alias")
+        if not table_alias or not table_alias.columns:
+            continue
+
+        retained = [
+            name
+            for name, roots in zip(flow.relation.columns, reachability.selections[union_scope])
+            if roots & bit
+        ]
+        if len(retained) == len(table_alias.columns):
+            continue
+
+        if journal is not None:
+            record(journal, table_alias, "columns")
+        original = {identifier.name: identifier for identifier in table_alias.columns}
+        table_alias.set(
+            "columns",
+            [original[name].copy() for name in retained],
+        )
 
 
 def _projection_properties(

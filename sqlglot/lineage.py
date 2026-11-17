@@ -8,14 +8,16 @@ from dataclasses import dataclass, field
 from sqlglot import Schema, exp, maybe_parse
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer import Scope, build_scope, find_all_in_scope, normalize_identifiers, qualify
-from sqlglot.optimizer.scope import ScopeType
+from sqlglot.optimizer.scope import RecursiveRelation, ScopeType
 from sqlglot.schema import ensure_schema
 
 if t.TYPE_CHECKING:
-    from sqlglot.dialects.dialect import DialectType
     from collections.abc import Iterator, Mapping, Sequence
-    from sqlglot._typing import GraphHTMLArgs
+
     from typing_extensions import Unpack
+
+    from sqlglot._typing import GraphHTMLArgs
+    from sqlglot.dialects.dialect import DialectType
 
 logger = logging.getLogger("sqlglot")
 
@@ -158,6 +160,9 @@ def lineage(
 
     cache: dict[tuple, Node] = {}
     scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+    # Values are either a RecursiveFlow, a per-relation node registry or an unsupported
+    # shape guard; their tuple keys keep the three namespaces disjoint.
+    flow_cache: dict[t.Any, t.Any] = {}
 
     if column is not None:
         column_name = normalize_identifiers.normalize_identifiers(column, dialect=dialect).name
@@ -172,6 +177,7 @@ def lineage(
             schema=schema,
             _cache=cache,
             _scope_meta=scope_meta,
+            _flow_cache=flow_cache,
             on_node=on_node,
         )
 
@@ -191,6 +197,7 @@ def lineage(
             schema=schema,
             _cache=cache,
             _scope_meta=scope_meta,
+            _flow_cache=flow_cache,
             on_node=on_node,
         )
 
@@ -209,8 +216,55 @@ def to_node(
     trim_selects: bool = True,
     _cache: dict[tuple, Node] | None = None,
     _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
+    _flow_cache: dict[t.Any, t.Any] | None = None,
     on_node: t.Callable[[Node], None] | None = None,
 ) -> Node:
+    # A recursive CTE's UNION ALL scope references itself; resolve the binding through
+    # the scope tree before the generic walk can loop on the cyclic source edge.
+    relation = scope.recursive_relation
+    if (
+        relation is not None
+        and relation.supported
+        and _flow_cache is not None
+        and isinstance(scope.expression, exp.SetOperation)
+    ):
+        return _recursive_to_node(
+            column,
+            scope,
+            relation,
+            dialect,
+            schema,
+            upstream=upstream,
+            scope_name=scope_name,
+            source_name=source_name,
+            reference_node_name=reference_node_name,
+            trim_selects=trim_selects,
+            _cache=_cache,
+            _scope_meta=_scope_meta,
+            _flow_cache=_flow_cache,
+            on_node=on_node,
+        )
+
+    if (
+        relation is not None
+        and isinstance(scope.expression, exp.SetOperation)
+        and not relation.supported
+    ):
+        # Unsupported recursive shape (e.g. UNION DISTINCT, aggregate): keep the historical
+        # conservative graph instead of following the cyclic self-reference forever. The
+        # anchor arm still carries a complete, finite view of the initial term. A second
+        # visit to the same relation output simply reconnects to the node built on the first.
+        if _flow_cache is None:
+            _flow_cache = {}
+        guard = _flow_cache.setdefault(("unsupported", id(scope)), {})
+        if column in guard:
+            node = guard[column]
+            if upstream is not None:
+                upstream.downstream.append(node)
+            return node
+    else:
+        guard = None
+
     cache_key = (column, id(scope), scope_name, source_name, reference_node_name)
 
     if _cache is not None and cache_key in _cache:
@@ -261,6 +315,7 @@ def to_node(
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _flow_cache=_flow_cache,
                 on_node=on_node,
             )
             # Skip caching a passed-in upstream returned by an inner SetOp:
@@ -290,7 +345,16 @@ def to_node(
         if index == -1:
             raise ValueError(f"Could not find {column} in {scope.expression}")
 
-        for s in scope.set_operation_scopes:
+        # Unsupported recursive relations still form a cyclic source edge; only descend
+        # into the anchor (first) arm. The recursive arm's self-reference would otherwise
+        # re-enter this node forever.
+        arm_scopes = scope.set_operation_scopes
+        if relation is not None and not relation.supported:
+            arm_scopes = arm_scopes[:1]
+            if guard is not None:
+                guard[column] = upstream
+
+        for s in arm_scopes:
             to_node(
                 index,
                 scope=s,
@@ -302,6 +366,7 @@ def to_node(
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _flow_cache=_flow_cache,
                 on_node=on_node,
             )
 
@@ -352,6 +417,7 @@ def to_node(
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _flow_cache=_flow_cache,
                 on_node=on_node,
             )
 
@@ -430,6 +496,7 @@ def to_node(
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _flow_cache=_flow_cache,
                 on_node=on_node,
             )
         elif pivots and pivots[-1].alias_or_name == c.table:
@@ -478,6 +545,7 @@ def to_node(
                         schema=schema,
                         _cache=_cache,
                         _scope_meta=_scope_meta,
+                        _flow_cache=_flow_cache,
                         on_node=on_node,
                     )
                 else:
@@ -504,10 +572,197 @@ def to_node(
     if _cache is not None:
         _cache[cache_key] = node
 
+    if guard is not None:
+        guard[column] = node
+
     if on_node:
         on_node(node)
 
     return node
+
+
+def _recursive_to_node(
+    column: str | int,
+    scope: Scope,
+    relation: RecursiveRelation,
+    dialect: DialectType,
+    schema: Schema,
+    upstream: Node | None,
+    scope_name: str | None,
+    source_name: str | None,
+    reference_node_name: str | None,
+    trim_selects: bool,
+    _cache: dict[tuple, Node] | None,
+    _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None,
+    _flow_cache: dict[t.Any, t.Any],
+    on_node: t.Callable[[Node], None] | None,
+) -> Node:
+    """Build a finite lineage node for one column of a supported recursive relation.
+
+    The returned node keeps the recursion recognizable instead of unrolling rounds:
+
+    * one relation node per output column identity;
+    * anchor and recursive-term value nodes beneath it, each traced to the base-table
+      columns they actually read;
+    * a back edge from each recursive column swap to the relation node it reads from
+      the previous iteration, so the graph stays finite while the cycle is explicit.
+
+    Predicate-only columns (WHERE / ON) never enter the value graph.
+    """
+    flow = relation.flow
+    _flow_cache.setdefault(id(scope), flow)
+
+    selectable = t.cast(exp.Selectable, scope.expression)
+    if isinstance(column, int):
+        index = column
+        if not 0 <= index < relation.width:
+            raise SqlglotError(
+                f"Cannot find column's source with index {index} in recursive relation "
+                f"'{relation.name}'."
+            )
+    else:
+        try:
+            index = relation.column_index(column)
+        except ValueError:
+            raise SqlglotError(
+                f"Cannot find column '{column}' in recursive relation '{relation.name}'."
+            ) from None
+
+    output_name = relation.columns[index]
+    cache_key = ("recursive", id(scope), index)
+    if _cache is not None and cache_key in _cache:
+        relation_node = _cache[cache_key]
+        if upstream:
+            upstream.downstream.append(relation_node)
+        return relation_node
+
+    # The relation node is published before its own descendants are built, so a back
+    # edge to this or any sibling relation column terminates at the shared node rather
+    # than restarting the walk around the cycle. A per-flow registry is required in
+    # addition to the caller cache because the same relation column can be requested
+    # through different cache-key spellings.
+    relation_registry = _flow_cache.setdefault(("nodes", id(scope)), {})
+    relation_node = relation_registry.get(index)
+    if relation_node is not None:
+        if upstream:
+            upstream.downstream.append(relation_node)
+        if _cache is not None:
+            _cache[cache_key] = relation_node
+        return relation_node
+
+    relation_node = Node(
+        name=f"{relation.name}.{output_name}",
+        source=scope.expression,
+        expression=selectable.selects[index],
+        source_name=source_name or "",
+        reference_node_name=reference_node_name or "",
+    )
+    relation_registry[index] = relation_node
+    if upstream:
+        upstream.downstream.append(relation_node)
+    if _cache is None:
+        _cache = {}
+    _cache[cache_key] = relation_node
+
+    anchor_scope = relation.anchor_scope
+    recursive_scope = relation.recursive_scope
+    anchor_expression = anchor_scope.expression.assert_is(exp.Select)
+    recursive_expression = recursive_scope.expression.assert_is(exp.Select)
+
+    # One value node per arm, each trimmed (when requested) to the projection at hand.
+    anchor_select = anchor_expression.selects[index]
+    recursive_select = recursive_expression.selects[index]
+    anchor_node = Node(
+        name=f"{relation.name}.{output_name}@anchor",
+        source=anchor_expression.select(anchor_select, append=False)
+        if trim_selects
+        else anchor_expression,
+        expression=anchor_select,
+    )
+    recursive_node = Node(
+        name=f"{relation.name}.{output_name}@recursive",
+        source=recursive_expression.select(recursive_select, append=False)
+        if trim_selects
+        else recursive_expression,
+        expression=recursive_select,
+    )
+    relation_node.downstream.extend((anchor_node, recursive_node))
+    if on_node:
+        on_node(anchor_node)
+        on_node(recursive_node)
+
+    external_cache: dict[tuple[str, str], Node] = {}
+
+    def external_node(key: tuple[str, str], owner: Node) -> None:
+        """Trace one non-relation column read to its base-table sources."""
+        cached = external_cache.get(key)
+        if cached is not None:
+            owner.downstream.append(cached)
+            return
+
+        table, name = key
+        source = recursive_scope.sources.get(table) or anchor_scope.sources.get(table)
+        if isinstance(source, Scope):
+            to_node(
+                name,
+                scope=source,
+                dialect=dialect,
+                scope_name=table,
+                upstream=owner,
+                trim_selects=trim_selects,
+                schema=schema,
+                _cache=_cache,
+                _scope_meta=_scope_meta,
+                _flow_cache=_flow_cache,
+                on_node=on_node,
+            )
+            external_cache[key] = owner.downstream[-1]
+        else:
+            col_expr = source or exp.Placeholder()
+            leaf = Node(
+                name=exp.column(name, table=table).sql(comments=False),
+                source=col_expr,
+                expression=col_expr,
+            )
+            owner.downstream.append(leaf)
+            external_cache[key] = leaf
+            if on_node:
+                on_node(leaf)
+
+    for key in flow.anchor_inputs[index]:
+        external_node(key, anchor_node)
+    for key in flow.recursive_external[index]:
+        external_node(key, recursive_node)
+
+    # Back edges make the recursive column swap explicit while keeping the graph finite:
+    # output i at one iteration reads relation column j from the previous iteration.
+    for producer in flow.recursive_inputs[index]:
+        if producer == index:
+            recursive_node.downstream.append(relation_node)
+            continue
+        recursive_node.downstream.append(
+            _recursive_to_node(
+                producer,
+                scope,
+                relation,
+                dialect,
+                schema,
+                upstream=None,
+                scope_name=scope_name,
+                source_name=source_name,
+                reference_node_name=reference_node_name,
+                trim_selects=trim_selects,
+                _cache=_cache,
+                _scope_meta=_scope_meta,
+                _flow_cache=_flow_cache,
+                on_node=on_node,
+            )
+        )
+
+    if on_node:
+        on_node(relation_node)
+
+    return relation_node
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema) -> list[str]:

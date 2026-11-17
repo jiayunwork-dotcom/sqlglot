@@ -4418,6 +4418,164 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         for side in (union.this, union.expression):
             self.assertEqual({s.alias_or_name for s in side.selects}, {"id"})
 
+    def test_recursive_relation_binding_distinguishes_relation_and_anchor(self):
+        from sqlglot.optimizer.scope import RecursiveRelation
+
+        schema = {"seed": {"x": "INT", "y": "INT", "z": "INT"}}
+        query = qualify(
+            parse_one(
+                "WITH RECURSIVE r(a,b) AS ("
+                "SELECT x, y FROM seed "
+                "UNION ALL "
+                "SELECT r.b, r.a FROM r WHERE r.a < 2) SELECT a FROM r",
+                read="sqlite",
+            ),
+            schema=schema,
+            dialect="sqlite",
+            identify=False,
+            validate_qualify_columns=False,
+        )
+        root = build_scope(query)
+        binding = root.recursive_relations["r"]
+
+        self.assertIsInstance(binding, RecursiveRelation)
+        self.assertEqual(binding.columns, ["a", "b"])
+        self.assertTrue(binding.supported)
+        # The recursive arm's self-reference resolves to the full UNION scope,
+        # not to the anchor seed scope.
+        self.assertIs(binding.recursive_scope.sources["r"], binding.scope)
+        self.assertIsNot(binding.anchor_scope, binding.scope)
+        # Ordinary scope traversal stays finite.
+        self.assertEqual(len(list(root.traverse())), len({id(s) for s in root.traverse()}))
+
+    def test_recursive_pushdown_prunes_dead_self_loop_and_keeps_conditions(self):
+        schema = {
+            "seed": {"x": "INT", "y": "INT", "z": "INT"},
+            "extra": {"id": "INT", "delta": "INT"},
+        }
+        sql = """
+            WITH RECURSIVE r(a,b,n,dead) AS (
+              SELECT x,y,0,z FROM seed
+              UNION ALL
+              SELECT r.b,r.a+e.delta,r.n+1,r.dead
+              FROM r JOIN extra e ON e.id=r.n WHERE r.n<3
+            ) SELECT a FROM r
+        """
+        optimized = pushdown_projections(
+            parse_one(sql, read="sqlite"),
+            schema=schema,
+            dialect="sqlite",
+        )
+        cte = optimized.find(exp.CTE)
+        self.assertEqual(cte.alias_column_names, ["a", "b", "n"])
+        for arm in (cte.this.this, cte.this.expression):
+            self.assertEqual([s.alias_or_name for s in arm.selects], ["a", "b", "n"])
+        # The row-condition column and its clauses survive; the dead column does not.
+        rendered = optimized.sql("sqlite")
+        self.assertIn("r.n < 3", rendered)
+        self.assertIn("e.id = r.n", rendered)
+        self.assertNotIn("dead", rendered)
+
+    def test_recursive_pushdown_unsupported_shape_keeps_everything(self):
+        schema = {"t": {"a": "INT", "b": "INT"}}
+        # UNION DISTINCT is outside the supported fixed-point shape
+        sql = (
+            "WITH RECURSIVE r(a,b) AS ("
+            "SELECT a, b FROM t "
+            "UNION "
+            "SELECT r.b, r.a FROM r WHERE r.a < 2) SELECT a FROM r"
+        )
+        optimized = pushdown_projections(
+            parse_one(sql, read="sqlite"),
+            schema=schema,
+            dialect="sqlite",
+        )
+        cte = optimized.find(exp.CTE)
+        for arm in (cte.this.this, cte.this.expression):
+            self.assertEqual({s.alias_or_name for s in arm.selects}, {"a", "b"})
+
+    def test_recursive_qualify_rejects_bad_columns_and_widths(self):
+        schema = {"seed": {"x": "INT", "y": "INT"}}
+        bad_column = (
+            "WITH RECURSIVE r(a,b) AS ("
+            "SELECT x,y FROM seed UNION ALL "
+            "SELECT r.b, r.nope FROM r) SELECT * FROM r"
+        )
+        with self.assertRaises(OptimizeError):
+            qualify(
+                parse_one(bad_column, read="sqlite"),
+                schema=schema,
+                dialect="sqlite",
+                identify=False,
+            )
+
+        bad_width = (
+            "WITH RECURSIVE r(a,b) AS ("
+            "SELECT x,y FROM seed UNION ALL SELECT r.b FROM r) SELECT * FROM r"
+        )
+        with self.assertRaises(OptimizeError):
+            qualify(
+                parse_one(bad_width, read="sqlite"),
+                schema=schema,
+                dialect="sqlite",
+                identify=False,
+            )
+
+        bad_list = (
+            "WITH RECURSIVE r(a,b,c) AS ("
+            "SELECT x,y FROM seed UNION ALL SELECT r.b, r.a FROM r) SELECT * FROM r"
+        )
+        with self.assertRaises(OptimizeError):
+            qualify(
+                parse_one(bad_list, read="sqlite"),
+                schema=schema,
+                dialect="sqlite",
+                identify=False,
+            )
+
+    def test_recursive_pushdown_reanalysis_points_at_remaining_columns(self):
+        from sqlglot.lineage import lineage
+        from sqlglot.optimizer.recursive import build_recursive_flow
+
+        schema = {
+            "seed": {"x": "INT", "y": "INT", "z": "INT"},
+            "extra": {"id": "INT", "delta": "INT"},
+        }
+        sql = """
+            WITH RECURSIVE r(a,b,n,dead) AS (
+              SELECT x,y,0,z FROM seed
+              UNION ALL
+              SELECT r.b,r.a+e.delta,r.n+1,r.dead
+              FROM r JOIN extra e ON e.id=r.n WHERE r.n<3
+            ) SELECT a FROM r
+        """
+        qualified = qualify(
+            parse_one(sql, read="sqlite"),
+            schema=schema,
+            dialect="sqlite",
+            identify=False,
+            validate_qualify_columns=False,
+        )
+        optimizer.pushdown_projections.pushdown_projections(qualified)
+        requalified = qualify(
+            qualified.copy(),
+            schema=schema,
+            dialect="sqlite",
+            identify=False,
+            validate_qualify_columns=False,
+        )
+        scope = build_scope(requalified)
+        binding = scope.recursive_relations["r"]
+        self.assertEqual(binding.columns, ["a", "b", "n"])
+        flow = build_recursive_flow(binding)
+        self.assertEqual(flow.recursive_inputs[0], [1])
+        self.assertEqual(flow.recursive_inputs[1], [0])
+        self.assertEqual(flow.predicate_recursive, frozenset({2}))
+
+        node = lineage("a", requalified, schema=schema, dialect="sqlite", scope=scope)
+        leaves = {n.expression.name for n in node.walk() if isinstance(n.expression, exp.Table)}
+        self.assertEqual(leaves, {"seed", "extra"})
+
     def test_schema_with_spaces(self):
         schema = {
             "a": {

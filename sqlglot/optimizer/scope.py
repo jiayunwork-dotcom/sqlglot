@@ -3,21 +3,30 @@ from __future__ import annotations
 import itertools
 import logging
 import typing as t
+from builtins import type as Type
 from collections import defaultdict
 from enum import Enum, auto
+from weakref import ref
 
 from sqlglot import exp
 from sqlglot.errors import OptimizeError
 from sqlglot.helper import find_new_name, mypyc_attr, seq_get
-from builtins import type as Type
 
 logger = logging.getLogger("sqlglot")
 
 if t.TYPE_CHECKING:
-    from sqlglot._typing import E
     from collections.abc import Iterator
 
+    from sqlglot._typing import E
+    from sqlglot.optimizer.recursive import RecursiveFlow
+
 TRAVERSABLES = (exp.Query, exp.DDL, exp.DML)
+
+
+# CTE node id -> weak references of every RecursiveRelation binding built for it. The
+# registry never owns either the AST or a binding, so scope rebuilds and expression
+# copies leave nothing behind; stale weak references are pruned on access.
+_recursive_relation_registry: dict[int, list[ref[RecursiveRelation]]] = {}
 
 ROW_LEVEL_AGG_FUNCS = (exp.Count,)
 
@@ -44,6 +53,136 @@ class ScopeType(Enum):
     CTE = auto()
     SET_OPERATION = auto()
     UDTF = auto()
+
+
+@mypyc_attr(allow_interpreted_subclasses=True)
+class RecursiveRelation:
+    """The fixed-point binding of a supported ``WITH RECURSIVE`` CTE.
+
+    A recursive CTE has the shape::
+
+        WITH RECURSIVE r(c1, ..., cC) AS (
+            <anchor>      -- non-recursive term
+            UNION ALL
+            <recursive>   -- references r itself once, in FROM or an INNER JOIN
+        )
+
+    The recursive term reads the relation ``r`` while its columns are also being
+    defined, so its columns need an identity distinct from both the anchor's output
+    columns and any base-table column. This object owns that identity.
+
+    The binding is a finite summary of the recursion, not an unrolling: it records,
+    once per recursive output column, which *recursive input* columns (values of the
+    same relation at the previous iteration) and which *non-recursive* columns (base
+    tables, ordinary CTEs and derived tables visible to the recursive term) feed it.
+    Its size is therefore O(C + E) for C column identities and E direct dependencies;
+    it never grows with the number of iterations, paths or data rows.
+
+    Attributes:
+        name: The CTE / relation name.
+        scope: The scope rooted at the CTE's ``UNION ALL`` expression. ``scope.sources``
+            maps this name back to the same scope, so column qualification, lineage and
+            projection pruning all resolve self-references through this single binding.
+        anchor_scope: Scope of the non-recursive (first) ``UNION ALL`` arm.
+        recursive_scope: Scope of the recursive (second) ``UNION ALL`` arm.
+        columns: Output column names of the relation, in positional order. They are the
+            names used by every self-reference inside the recursive term.
+        cte: The ``exp.CTE`` node declaring the relation.
+        alias_columns: Explicit column list on the CTE, when one was given.
+        supported: Whether the relation matches the supported shape. Unsupported
+            relations keep ``supported=False``; consumers must use conservative
+            behavior and never treat the binding as a complete dependency summary.
+    """
+
+    __slots__ = (
+        "__weakref__",
+        "_flow",
+        "alias_columns",
+        "anchor_scope",
+        "columns",
+        "cte",
+        "name",
+        "recursive_scope",
+        "scope",
+        "self_reference",
+        "supported",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        scope: Scope,
+        anchor_scope: Scope,
+        recursive_scope: Scope,
+        columns: list[str],
+        cte: exp.CTE,
+        alias_columns: list[str],
+        supported: bool,
+        self_reference: exp.Table | None = None,
+    ) -> None:
+        self.name = name
+        self.scope = scope
+        self.anchor_scope = anchor_scope
+        self.recursive_scope = recursive_scope
+        self.columns = columns
+        self.cte = cte
+        self.alias_columns = alias_columns
+        self.supported = supported
+        self.self_reference = self_reference
+        # The flow cache is a private slot on this binding; bindings built by different
+        # scope traversals share it via the weak registry keyed by the CTE node, so the
+        # cache survives a scope rebuild over the same AST without keeping either the AST
+        # or the binding alive.
+        self._flow: RecursiveFlow | None = None
+        relations = _recursive_relation_registry.setdefault(id(cte), [])
+        relations.append(ref(self))
+        for other in relations:
+            cached = other()
+            if cached is not None and cached is not self and cached._flow is not None:
+                self._flow = cached._flow
+                break
+
+    @property
+    def flow(self) -> RecursiveFlow:
+        """The cached RecursiveFlow summary, computed on first access."""
+        if self._flow is None:
+            from sqlglot.optimizer.recursive import build_recursive_flow
+
+            self._flow = build_recursive_flow(self)
+        return self._flow
+
+    def invalidate_flow(self) -> None:
+        """Drop this relation's cached flow, including on earlier bindings for the same CTE."""
+        for binding_ref in _recursive_relation_registry.get(id(self.cte), []):
+            binding = binding_ref()
+            if binding is not None:
+                binding._flow = None
+
+    @property
+    def width(self) -> int:
+        """Number of column identities owned by the relation."""
+        return len(self.columns)
+
+    def column_index(self, name: str) -> int:
+        """Position of a recursive input/output column name in the relation."""
+        return self.columns.index(name)
+
+    def recursive_columns(self, table_name: str | None = None) -> list[exp.Column]:
+        """Columns the recursive term reads from its own relation.
+
+        ``table_name`` filters on the qualifier used at the reference site. Every
+        returned column belongs to :attr:`recursive_scope`; predicates (WHERE / ON)
+        and value projections are not distinguished here, callers classify by the
+        column's ancestor.
+        """
+        result: list[exp.Column] = []
+        for column in find_all_in_scope(self.recursive_scope.expression, exp.Column):
+            if column.table == self.name and (table_name is None or column.table == table_name):
+                result.append(column)
+        return result
+
+    def __repr__(self) -> str:
+        return f"RecursiveRelation<{self.name}({', '.join(self.columns)})>"
 
 
 @mypyc_attr(native_class=True)
@@ -77,6 +216,10 @@ class Scope:
         table_scopes: derived_table_scopes + udtf_scopes, in the order that they're defined
         set_operation_scopes: If this Scope is for a SetOperation expression, this will be
             a list of the left and right child scopes.
+        recursive_relation: When this scope is the UNION ALL body of a supported recursive
+            CTE, the RecursiveRelation binding that gives the relation's columns their own
+            identity; None otherwise. The same binding is reachable from the root scope's
+            recursive_relations registry.
     """
 
     _collected: bool
@@ -111,6 +254,7 @@ class Scope:
         lateral_sources: dict[str, exp.Table | Scope] | None = None,
         cte_sources: dict[str, exp.Table | Scope] | None = None,
         can_be_correlated: bool | None = None,
+        recursive_relation: RecursiveRelation | None = None,
     ) -> None:
         self.expression = expression
         self.sources = sources or {}
@@ -128,6 +272,12 @@ class Scope:
         self.set_operation_scopes: list[Scope] = []
         self.udtf_scopes: list[Scope] = []
         self.can_be_correlated = can_be_correlated
+        self.recursive_relation = recursive_relation
+        # RecursiveRelation bindings whose WITH clause is owned by this scope, keyed by
+        # relation name. Inner scopes keep their own map, so a same-named inner CTE
+        # shadows an outer one instead of overwriting it. The root additionally indexes
+        # every binding by `id(relation scope)` for whole-tree lookups.
+        self.recursive_relations: dict[str | int, RecursiveRelation] = {}
         self.clear_cache()
 
     def clear_column_cache(self) -> None:
@@ -668,6 +818,29 @@ class Scope:
 
         return scope_ref_count
 
+    @property
+    def root_scope(self) -> Scope:
+        """The topmost scope of this scope tree."""
+        scope = self
+        while scope.parent is not None:
+            scope = scope.parent
+        return scope
+
+    def recursive_binding(self, name: str) -> RecursiveRelation | None:
+        """Look up a recursive relation binding visible from this scope, by CTE name.
+
+        Inner scopes shadow outer CTEs of the same name: the lookup walks the scope
+        hierarchy innermost-first and returns the first binding declared by a scope
+        whose relation source is actually visible here.
+        """
+        scope: Scope | None = self
+        while scope is not None:
+            relation = scope.recursive_relations.get(name)
+            if relation is not None:
+                return relation
+            scope = scope.parent
+        return None
+
 
 def traverse_scope(expression: exp.Expr) -> list[Scope]:
     """
@@ -870,6 +1043,7 @@ def _traverse_set_operation(scope: Scope) -> Iterator[Scope]:
 
 def _traverse_ctes(scope: Scope) -> Iterator[Scope]:
     sources: dict[str, exp.Table | Scope] = {}
+    recursive_bindings: list[RecursiveRelation] = []
 
     for cte in scope.ctes:
         cte_name = cte.alias
@@ -877,11 +1051,10 @@ def _traverse_ctes(scope: Scope) -> Iterator[Scope]:
         # if the scope is a recursive cte, it must be in the form of base_case UNION recursive.
         # thus the recursive scope is the first section of the union.
         with_ = scope.expression.args.get("with_")
-        if with_ and with_.recursive:
-            union = cte.this
+        union = cte.this if with_ and with_.recursive else None
 
-            if isinstance(union, exp.SetOperation):
-                sources[cte_name] = scope.branch(union.this, scope_type=ScopeType.CTE)
+        if isinstance(union, exp.SetOperation):
+            sources[cte_name] = scope.branch(union.this, scope_type=ScopeType.CTE)
 
         child_scope: Scope | None = None
 
@@ -900,8 +1073,123 @@ def _traverse_ctes(scope: Scope) -> Iterator[Scope]:
             sources[cte_name] = child_scope
             scope.cte_scopes.append(child_scope)
 
+            if isinstance(union, exp.SetOperation):
+                binding = _bind_recursive_cte(cte, union, child_scope)
+                if binding is not None:
+                    recursive_bindings.append(binding)
+
     scope.sources.update(sources)
     scope.cte_sources.update(sources)
+
+    # Bindings declared by this WITH clause are kept on the scope that owns it, so an
+    # inner CTE of the same name shadows the outer binding instead of overwriting it.
+    scope.recursive_relations.update({binding.name: binding for binding in recursive_bindings})
+
+    root = scope.root_scope
+    for binding in recursive_bindings:
+        # The root registry still indexes every binding by expression id for callers
+        # that start from the root; same-named declarations remain distinguishable via
+        # their own scope's recursive_relations map and recursive_binding().
+        root.recursive_relations.setdefault(id(binding.scope), binding)
+
+
+def _bind_recursive_cte(
+    cte: exp.CTE, union: exp.SetOperation, union_scope: Scope
+) -> RecursiveRelation | None:
+    """Give a recursive CTE's self-reference a fixed-point column identity.
+
+    The traversal seeds the relation name with the anchor scope so the recursive term
+    can be collected, then replaces the seed everywhere within the CTE body with the
+    finished UNION scope. Without the replacement, self-references would resolve to the
+    anchor term only, silently dropping sources the recursive term introduces later.
+    """
+    name = cte.alias
+    arm_scopes = union_scope.set_operation_scopes
+    if len(arm_scopes) != 2:
+        return None
+
+    anchor_scope, recursive_scope = arm_scopes
+    self_references = [
+        table
+        for table in find_all_in_scope(recursive_scope.expression, exp.Table)
+        if not table.db and table.name == name
+    ]
+
+    # Rewire every self-reference inside the recursive term and the union's own source
+    # map to the relation's scope instead of the anchor seed scope.
+    rewired = False
+    for arm_scope in (anchor_scope, recursive_scope, union_scope):
+        for source_name, source in list(arm_scope.sources.items()):
+            if source_name == name and source is not union_scope:
+                arm_scope.sources[source_name] = union_scope
+                rewired = True
+        for source_name, source in list(arm_scope.cte_sources.items()):
+            if source_name == name and source is not union_scope:
+                arm_scope.cte_sources[source_name] = union_scope
+                rewired = True
+
+    if not rewired and not self_references:
+        return None
+
+    alias_columns = cte.alias_column_names
+    columns = alias_columns or [select.alias_or_name for select in union.this.selects]
+    supported = _is_supported_recursive_relation(union, self_references)
+
+    binding = RecursiveRelation(
+        name=name,
+        scope=union_scope,
+        anchor_scope=anchor_scope,
+        recursive_scope=recursive_scope,
+        columns=list(columns),
+        cte=cte,
+        alias_columns=alias_columns,
+        supported=supported and bool(self_references),
+        self_reference=self_references[0] if self_references else None,
+    )
+    union_scope.recursive_relation = binding
+    recursive_scope.recursive_relation = binding
+    return binding
+
+
+def _is_supported_recursive_relation(
+    union: exp.SetOperation, self_references: list[exp.Table]
+) -> bool:
+    """Whether the recursive CTE matches the shape the fixed-point analysis supports."""
+    if not isinstance(union, exp.Union) or union.args.get("distinct"):
+        return False
+
+    anchor = union.this.unnest()
+    recursive = union.expression.unnest()
+    if not isinstance(anchor, exp.Select) or not isinstance(recursive, exp.Select):
+        return False
+
+    if len(self_references) != 1:
+        return False
+
+    reference = self_references[0]
+    parent = reference.parent
+    if not isinstance(parent, (exp.From, exp.Join)) or (
+        isinstance(parent, exp.Join) and parent.method not in (None, "INNER")
+    ):
+        return False
+
+    # The recursive term must not aggregate, deduplicate, window, paginate or nest a
+    # correlated query while reading its own relation. Table-isolation rewrites ordinary
+    # base tables into FROM/JOIN-position derived tables, which stay within the supported
+    # shape; only value/predicate-position subqueries disqualify the relation.
+    if recursive.args.get("distinct") or recursive.args.get("group") or recursive.args.get("order"):
+        return False
+    if recursive.args.get("limit") or recursive.args.get("offset") or recursive.args.get("having"):
+        return False
+    for node in recursive.walk():
+        if node is recursive:
+            continue
+        if isinstance(node, (exp.AggFunc, exp.Window)):
+            return False
+        if isinstance(node, exp.Subquery) and not _is_from_or_join(node):
+            return False
+
+    return True
 
 
 def _is_derived_table(expression: exp.Expr) -> bool:

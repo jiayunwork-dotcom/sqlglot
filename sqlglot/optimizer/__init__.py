@@ -24,7 +24,12 @@ _import_lock = threading.RLock()
 # Only for type checkers and IDEs; runtime resolution goes through __getattr__.
 if t.TYPE_CHECKING:
     from sqlglot.optimizer.optimizer import RULES as RULES, optimize as optimize
+    from sqlglot.optimizer.recursive import (
+        RecursiveFlow as RecursiveFlow,
+        build_recursive_flow as build_recursive_flow,
+    )
     from sqlglot.optimizer.scope import (
+        RecursiveRelation as RecursiveRelation,
         Scope as Scope,
         build_scope as build_scope,
         find_all_in_scope as find_all_in_scope,
@@ -38,6 +43,9 @@ if t.TYPE_CHECKING:
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "RULES": ("sqlglot.optimizer.optimizer", "RULES"),
     "optimize": ("sqlglot.optimizer.optimizer", "optimize"),
+    "RecursiveFlow": ("sqlglot.optimizer.recursive", "RecursiveFlow"),
+    "build_recursive_flow": ("sqlglot.optimizer.recursive", "build_recursive_flow"),
+    "RecursiveRelation": ("sqlglot.optimizer.scope", "RecursiveRelation"),
     "Scope": ("sqlglot.optimizer.scope", "Scope"),
     "build_scope": ("sqlglot.optimizer.scope", "build_scope"),
     "find_all_in_scope": ("sqlglot.optimizer.scope", "find_all_in_scope"),

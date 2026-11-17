@@ -22,8 +22,9 @@ from sqlglot.optimizer.simplify import simplify_parens
 from sqlglot.schema import Schema, ensure_schema
 
 if t.TYPE_CHECKING:
-    from sqlglot._typing import E
     from collections.abc import Iterable
+
+    from sqlglot._typing import E
 
 
 GROUPING_CONTAINERS = (exp.Group, exp.GroupingSets, exp.Cube, exp.Rollup, exp.Tuple, exp.Paren)
@@ -138,7 +139,55 @@ def qualify_columns(
         elif dialect.SUPPORTS_STRUCT_STAR_EXPANSION:
             unannotated_scopes.append(scope)
 
+        _validate_recursive_cte(scope)
+
     return expression
+
+
+def _validate_recursive_cte(scope: Scope) -> None:
+    """Enforce explicit, shape-checked recursive CTEs instead of silently filling columns.
+
+    Runs once per *supported* recursive relation after both arms are qualified: the arms
+    must expose the same width, an explicit CTE column list must match that width, and
+    every column the recursive term reads from its own relation must name one of the
+    relation's columns. Errors are raised against the real CTE rather than repaired with
+    the anchor's same-named column, an unknown leaf or a dropped column. Unsupported
+    shapes (e.g. more than two UNION arms) keep the historical, more permissive behavior.
+    """
+    relation = scope.recursive_relation
+    if relation is None or scope is not relation.scope or not relation.supported:
+        return
+
+    anchor_expression = relation.anchor_scope.expression
+    recursive_expression = relation.recursive_scope.expression
+    if not isinstance(anchor_expression, exp.Select) or not isinstance(
+        recursive_expression, exp.Select
+    ):
+        return
+
+    anchor_width = len(anchor_expression.selects)
+    recursive_width = len(recursive_expression.selects)
+    if anchor_width != recursive_width:
+        raise OptimizeError(
+            "Recursive CTE arms must have the same number of result columns: "
+            f"{anchor_width} vs {recursive_width} in '{relation.name}'."
+        )
+
+    if relation.alias_columns and len(relation.alias_columns) != anchor_width:
+        raise OptimizeError(
+            f"Recursive CTE '{relation.name}' declares {len(relation.alias_columns)} "
+            f"columns but its arms produce {anchor_width}."
+        )
+
+    if not relation.alias_columns:
+        relation_names = {select.alias_or_name for select in anchor_expression.selects}
+    else:
+        relation_names = set(relation.alias_columns)
+    for column in find_all_in_scope(recursive_expression, exp.Column):
+        if column.table == relation.name and column.name not in relation_names:
+            raise OptimizeError(
+                f"Unknown recursive column '{column.name}' for relation '{relation.name}'."
+            )
 
 
 def validate_qualify_columns(expression: E, sql: str | None = None) -> E:
