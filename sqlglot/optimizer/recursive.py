@@ -15,6 +15,25 @@ identities and E direct dependencies the resident state is O(C + E): edges are s
 once each and the fixed point is reached by a work-list fixpoint, never by unrolling
 iterations or enumerating recursive paths, so the cost is independent of runtime
 recursion depth, path count and data volume.
+
+External sources are identified by the *resolved source*, never by the local alias used
+at a reference site. A scope source is keyed by the identity of its query expression; a
+base table is keyed by its catalog/database/name. The alias is only used to resolve the
+reference inside its own query block. Consequently:
+
+* the two arms of a recursive CTE may reuse one alias (``s``) for different sources
+  without merging them, and a self-reference may be aliased (``FROM r AS rr``) without
+  being mistaken for an external table;
+* two aliases of the same CTE are one source, while two same-named CTEs in different
+  nested scopes are different sources;
+* an alias column list (``x AS s(p, q)``, ``r AS rr(a, b)``) is mapped positionally to
+  the source's output columns before the source key is formed.
+
+The flow is cached once per :class:`RecursiveRelation` binding (O(C + E) resident state),
+so every reference to the same CTE, both arms, lineage of several outputs and repeated
+projection reachability share one analysis. It is deliberately *not* shared between scope
+trees built over different or rewritten ASTs; :meth:`RecursiveRelation.invalidate_flow`
+drops it after in-place projection pruning.
 """
 
 from __future__ import annotations
@@ -23,10 +42,13 @@ import typing as t
 from dataclasses import dataclass
 
 from sqlglot import exp
-from sqlglot.optimizer.scope import RecursiveRelation, find_all_in_scope
+from sqlglot.errors import OptimizeError
+from sqlglot.optimizer.scope import RecursiveRelation, Scope, find_all_in_scope
 
 if t.TYPE_CHECKING:
     from collections.abc import Iterator
+
+SourceKey = tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -34,22 +56,35 @@ class ExternalColumn:
     """A column the recursive body reads from a source other than the relation itself.
 
     Attributes:
-        table: Qualifier of the column at the recursive reference site (source alias).
-        name: Column name under that qualifier.
-        expression: The actual qualified ``exp.Column`` node.
+        source_key: Identity of the resolved source *and* the source's output column name.
+            Query sources are keyed by their query expression identity, base tables by
+            their catalog/database/name, so two local aliases with the same spelling never
+            collide while different columns of one source stay distinct.
+        kind: ``"query"`` (CTE / derived table / other scope), ``"table"`` (physical
+            table) or ``"unresolved"`` (a correlated or unqualified reference whose source
+            cannot be resolved from the arm's own scope).
+        expression: The ``exp.Table`` node of a base table, the query expression of a
+            scope source, or the unresolved ``exp.Column``.
+        table: Reference-site alias, used for lineage node labels.
+        name: Column name at the reference site.
+        output_name: Column name exposed by the resolved source (after alias-column
+            remapping).
         predicate_only: True when the column appears only inside WHERE / ON conditions,
             never in a value projection of either arm. It still controls which rows the
             recursion produces, but is not a value source for any output.
     """
 
+    source_key: SourceKey
+    kind: str
+    expression: exp.Expr
     table: str
     name: str
-    expression: exp.Column
+    output_name: str
     predicate_only: bool
 
     @property
-    def key(self) -> tuple[str, str]:
-        return (self.table, self.name)
+    def key(self) -> SourceKey:
+        return self.source_key
 
 
 @dataclass
@@ -61,29 +96,80 @@ class RecursiveFlow:
 
     Attributes:
         relation: The binding this flow summarizes.
-        anchor_inputs: For each output position, external (table, column) keys the anchor
-            term reads for that projection.
+        anchor_inputs: For each output position, external source keys the anchor term
+            reads for that projection.
         recursive_inputs: For each output position, relation column indexes the recursive
             term reads from its own previous iteration for that projection.
         recursive_external: For each output position, external keys the recursive term
             introduces in that projection.
         external: Every distinct external column referenced anywhere in the two arms,
-            keyed by (qualifier, name), with predicate usage classified.
+            keyed by resolved-source identity, with predicate usage classified.
         predicate_recursive: Relation column indexes used by WHERE / ON in either arm.
-        condition_external: External keys used by WHERE / ON in either arm.
+        anchor_conditions: External keys used by WHERE / ON of the anchor arm.
+        recursive_conditions: External keys used by WHERE / ON of the recursive arm.
+        condition_external: Union of both condition sets.
     """
 
     relation: RecursiveRelation
-    anchor_inputs: list[list[tuple[str, str]]]
+    anchor_inputs: list[list[SourceKey]]
     recursive_inputs: list[list[int]]
-    recursive_external: list[list[tuple[str, str]]]
-    external: dict[tuple[str, str], ExternalColumn]
+    recursive_external: list[list[SourceKey]]
+    external: dict[SourceKey, ExternalColumn]
     predicate_recursive: frozenset[int]
-    condition_external: frozenset[tuple[str, str]]
+    anchor_conditions: frozenset[SourceKey]
+    recursive_conditions: frozenset[SourceKey]
+    # Reference-site ``exp.Column`` id -> classification. Consumers (projection
+    # pruning, lineage) look columns up here instead of re-resolving the local alias,
+    # so both consumers agree with the arm analysis that built this flow.
+    anchor_column_keys: dict[int, SourceKey]
+    recursive_column_keys: dict[int, SourceKey]
+    anchor_self_columns: dict[int, int]
+    recursive_self_columns: dict[int, int]
+
+    @property
+    def condition_external(self) -> frozenset[SourceKey]:
+        """External keys used by WHERE / ON in either arm."""
+        return self.anchor_conditions | self.recursive_conditions
+
+    def column_key(self, column: exp.Column) -> SourceKey | None:
+        """External source key for a column reference, or None if it is not external.
+
+        Lookup is by the ``exp.Column`` node's identity, which is stable across the scope
+        rebuilds performed over one AST, so a flow shared between analyses stays valid
+        even though their ``Scope`` instances differ. A column node belongs to exactly
+        one arm, so the two maps cannot disagree.
+        """
+        key = self.anchor_column_keys.get(id(column))
+        if key is None:
+            key = self.recursive_column_keys.get(id(column))
+        return key
+
+    def self_column_index(self, column: exp.Column) -> int | None:
+        """Positional relation column index for a self-reference, or None."""
+        index = self.anchor_self_columns.get(id(column))
+        if index is None:
+            index = self.recursive_self_columns.get(id(column))
+        return index
+
+    def scope_for_key(self, key: SourceKey, *scope_pools: Scope) -> Scope | None:
+        """Find the Scope object whose expression is the resolved source of ``key``.
+
+        The flow stores source identity by expression identity, which survives the
+        scope rebuilds that projection pruning and lineage perform over the same AST.
+        """
+        if key[0] != "query":
+            return None
+
+        expression_id = int(key[1])
+        for root in scope_pools:
+            for scope in root.traverse():
+                if id(scope.expression) == expression_id:
+                    return scope
+        return None
 
     def value_closure(
         self, outputs: t.Iterable[int]
-    ) -> tuple[frozenset[int], frozenset[tuple[str, str]]]:
+    ) -> tuple[frozenset[int], frozenset[SourceKey]]:
         """All relation columns and external value sources needed for ``outputs``.
 
         The closure follows recursive value edges (output i reads previous-iteration
@@ -102,7 +188,7 @@ class RecursiveFlow:
                 if j not in reached:
                     pending.append(j)
 
-        external: set[tuple[str, str]] = set()
+        external: set[SourceKey] = set()
         for i in reached:
             external.update(self.anchor_inputs[i])
             external.update(self.recursive_external[i])
@@ -173,8 +259,6 @@ def build_recursive_flow(relation: RecursiveRelation) -> RecursiveFlow:
     if relation._flow is not None:
         return relation._flow
 
-    from sqlglot.errors import OptimizeError
-
     width = relation.width
     anchor_expression = relation.anchor_scope.expression
     recursive_expression = relation.recursive_scope.expression
@@ -182,9 +266,9 @@ def build_recursive_flow(relation: RecursiveRelation) -> RecursiveFlow:
         recursive_expression, exp.Select
     ):
         raise OptimizeError(f"Recursive CTE '{relation.name}' arms must be SELECT statements.")
+
     anchor_selects = anchor_expression.selects
     recursive_selects = recursive_expression.selects
-
     if len(anchor_selects) != width or len(recursive_selects) != width:
         raise OptimizeError(
             "Recursive CTE arms must have the same number of columns as the relation "
@@ -192,77 +276,164 @@ def build_recursive_flow(relation: RecursiveRelation) -> RecursiveFlow:
         )
 
     name_to_index = {name: i for i, name in enumerate(relation.columns)}
-    external: dict[tuple[str, str], ExternalColumn] = {}
-    value_external: set[tuple[str, str]] = set()
+    external: dict[SourceKey, ExternalColumn] = {}
+    value_keys: set[SourceKey] = set()
+    anchor_conditions: set[SourceKey] = set()
+    recursive_conditions: set[SourceKey] = set()
+    predicate_recursive: set[int] = set()
+    anchor_inputs: list[list[SourceKey]] = []
+    recursive_inputs: list[list[int]] = []
+    recursive_external: list[list[SourceKey]] = []
+    anchor_column_keys: dict[int, SourceKey] = {}
+    recursive_column_keys: dict[int, SourceKey] = {}
+    anchor_self_columns: dict[int, int] = {}
+    recursive_self_columns: dict[int, int] = {}
 
-    def classify_external(scope_expression: exp.Expr, projections: list[exp.Expr]) -> None:
-        predicate_tables = _predicate_tables(scope_expression)
-        for column in find_all_in_scope(scope_expression, exp.Column):
-            if column.table == relation.name:
-                continue
-            key = (column.table, column.name)
-            in_predicate = column.table in predicate_tables and _is_inside_predicate(column)
-            entry = external.get(key)
-            if entry is None:
-                external[key] = ExternalColumn(
-                    table=column.table,
-                    name=column.name,
-                    expression=column,
-                    predicate_only=in_predicate,
-                )
-            elif not in_predicate:
-                external[key] = ExternalColumn(
-                    table=column.table,
-                    name=column.name,
-                    expression=column,
-                    predicate_only=False,
-                )
-        for projection in projections:
-            for column in find_all_in_scope(projection, exp.Column):
-                if column.table != relation.name:
-                    value_external.add((column.table, column.name))
+    def register(key: SourceKey, entry: ExternalColumn) -> None:
+        existing = external.get(key)
+        if existing is None:
+            external[key] = entry
+        elif existing.kind == "unresolved" and entry.kind != "unresolved":
+            # Prefer a resolved source over a conservative placeholder.
+            external[key] = entry
 
-    classify_external(relation.anchor_scope.expression, anchor_selects)
-    classify_external(relation.recursive_scope.expression, recursive_selects)
+    def analyze_arm(arm_scope: Scope, is_recursive: bool) -> None:
+        reference_nodes: dict[str, exp.Expr] = {}
+        for reference_name, reference_node in arm_scope.references:
+            reference_nodes.setdefault(reference_name, reference_node)
 
-    # Anything seen in a value projection is not predicate-only.
-    for key in value_external:
-        entry = external.get(key)
-        if entry is not None and entry.predicate_only:
-            external[key] = ExternalColumn(
-                table=entry.table,
-                name=entry.name,
-                expression=entry.expression,
-                predicate_only=False,
+        def resolve(column: exp.Column) -> tuple[int | None, SourceKey | None]:
+            alias = column.table
+            source = arm_scope.sources.get(alias) if alias else None
+            reference = reference_nodes.get(alias)
+            alias_columns = (
+                list(reference.alias_column_names) if isinstance(reference, exp.Table) else []
             )
 
-    anchor_inputs: list[list[tuple[str, str]]] = []
-    recursive_inputs: list[list[int]] = []
-    recursive_external: list[list[tuple[str, str]]] = []
+            # Self-reference: an unqualified table whose name is the relation's own name.
+            # That is exactly how the binder recognises the self-reference (a db-qualified
+            # table of the same name is a real table). The alias spelling and an optional
+            # alias-column list (r AS rr(a, b)) are local to this arm.
+            if (
+                isinstance(source, Scope)
+                and isinstance(reference, exp.Table)
+                and not reference.db
+                and reference.name == relation.name
+            ):
+                index = _self_index(column, alias_columns, name_to_index, relation)
+                if is_recursive:
+                    recursive_self_columns[id(column)] = index
+                else:
+                    anchor_self_columns[id(column)] = index
+                return index, None
 
-    for i, (anchor_select, recursive_select) in enumerate(zip(anchor_selects, recursive_selects)):
-        anchor_keys = [
-            (c.table, c.name)
-            for c in find_all_in_scope(anchor_select, exp.Column)
-            if c.table != relation.name
-        ]
-        anchor_inputs.append(anchor_keys)
-
-        own_indexes: list[int] = []
-        outside_keys: list[tuple[str, str]] = []
-        for column in find_all_in_scope(recursive_select, exp.Column):
-            if column.table == relation.name:
-                if column.name not in name_to_index:
-                    raise OptimizeError(
-                        f"Unknown recursive column '{column.name}' for relation '{relation.name}'."
-                    )
-                own_indexes.append(name_to_index[column.name])
+            if isinstance(source, Scope):
+                output_name = _map_output_name(column.name, alias_columns, source)
+                key: SourceKey = ("query", str(id(source.expression)), output_name)
+                entry = ExternalColumn(
+                    source_key=key,
+                    kind="query",
+                    expression=source.expression,
+                    table=alias,
+                    name=column.name,
+                    output_name=output_name,
+                    predicate_only=False,
+                )
+            elif isinstance(source, exp.Table):
+                key = (
+                    "table",
+                    source.catalog or "",
+                    source.db or "",
+                    source.name,
+                    column.name,
+                )
+                entry = ExternalColumn(
+                    source_key=key,
+                    kind="table",
+                    expression=source,
+                    table=alias,
+                    name=column.name,
+                    output_name=column.name,
+                    predicate_only=False,
+                )
             else:
-                outside_keys.append((column.table, column.name))
-        recursive_inputs.append(list(dict.fromkeys(own_indexes)))
-        recursive_external.append(outside_keys)
+                key = ("unresolved", alias or "", column.name)
+                entry = ExternalColumn(
+                    source_key=key,
+                    kind="unresolved",
+                    expression=column,
+                    table=alias,
+                    name=column.name,
+                    output_name=column.name,
+                    predicate_only=False,
+                )
 
-    predicate_recursive, condition_external = _predicate_dependencies(relation, name_to_index)
+            if is_recursive:
+                recursive_column_keys[id(column)] = key
+            else:
+                anchor_column_keys[id(column)] = key
+
+            register(key, entry)
+            return None, key
+
+        selects = anchor_selects if not is_recursive else recursive_selects
+        for i, projection in enumerate(selects):
+            own_indexes: list[int] = []
+            outside_keys: list[SourceKey] = []
+            for column in find_all_in_scope(projection, exp.Column):
+                own_index, key = resolve(column)
+                if own_index is not None:
+                    if is_recursive:
+                        own_indexes.append(own_index)
+                    # A supported relation never reads itself from the anchor term; if
+                    # that shape is encountered it is left unsupported by the binder, so
+                    # the anchor contribution is simply not a recursive value edge.
+                elif key is not None:
+                    outside_keys.append(key)
+                    value_keys.add(key)
+
+            if is_recursive:
+                recursive_inputs.append(list(dict.fromkeys(own_indexes)))
+                recursive_external.append(list(dict.fromkeys(outside_keys)))
+            else:
+                anchor_inputs.append(list(dict.fromkeys(outside_keys)))
+
+        condition_keys = anchor_conditions if not is_recursive else recursive_conditions
+        clauses: list[exp.Expr] = []
+        where = arm_scope.expression.args.get("where")
+        if where is not None:
+            clauses.append(where)
+        for join in arm_scope.expression.args.get("joins") or []:
+            on = join.args.get("on")
+            if on is not None:
+                clauses.append(on)
+
+        for clause in clauses:
+            for column in find_all_in_scope(clause, exp.Column):
+                own_index, key = resolve(column)
+                if own_index is not None:
+                    predicate_recursive.add(own_index)
+                elif key is not None:
+                    condition_keys.add(key)
+
+    analyze_arm(relation.anchor_scope, is_recursive=False)
+    analyze_arm(relation.recursive_scope, is_recursive=True)
+
+    # A column used only in WHERE / ON controls rows but is not a value source. A column
+    # that also appears in a value projection remains a value source.
+    conditions = anchor_conditions | recursive_conditions
+    for key in conditions:
+        if key not in value_keys:
+            entry = external[key]
+            external[key] = ExternalColumn(
+                source_key=entry.source_key,
+                kind=entry.kind,
+                expression=entry.expression,
+                table=entry.table,
+                name=entry.name,
+                output_name=entry.output_name,
+                predicate_only=True,
+            )
 
     flow = RecursiveFlow(
         relation=relation,
@@ -271,53 +442,52 @@ def build_recursive_flow(relation: RecursiveRelation) -> RecursiveFlow:
         recursive_external=recursive_external,
         external=external,
         predicate_recursive=frozenset(predicate_recursive),
-        condition_external=frozenset(condition_external),
+        anchor_conditions=frozenset(anchor_conditions),
+        recursive_conditions=frozenset(recursive_conditions),
+        anchor_column_keys=anchor_column_keys,
+        recursive_column_keys=recursive_column_keys,
+        anchor_self_columns=anchor_self_columns,
+        recursive_self_columns=recursive_self_columns,
     )
     relation._flow = flow
     return flow
 
 
-def _predicate_tables(scope_expression: exp.Expr) -> set[str]:
-    """Source aliases that carry a WHERE clause or an INNER JOIN ON clause."""
-    tables: set[str] = set()
-    where = scope_expression.args.get("where")
-    if where is not None:
-        for column in find_all_in_scope(where, exp.Column):
-            tables.add(column.table)
-    for join in scope_expression.args.get("joins") or []:
-        on = join.args.get("on")
-        if on is not None:
-            for column in find_all_in_scope(on, exp.Column):
-                tables.add(column.table)
-    return tables
+def _self_index(
+    column: exp.Column,
+    alias_columns: list[str],
+    name_to_index: dict[str, int],
+    relation: RecursiveRelation,
+) -> int:
+    """Positional index of a recursive input column, honouring the reference alias list."""
+    width = relation.width
+    if alias_columns:
+        try:
+            position = alias_columns.index(column.name)
+        except ValueError:
+            position = -1
+        if 0 <= position < width:
+            return position
+    index = name_to_index.get(column.name)
+    if index is None:
+        raise OptimizeError(
+            f"Unknown recursive column '{column.name}' for relation '{relation.name}'."
+        )
+    return index
 
 
-def _is_inside_predicate(column: exp.Column) -> bool:
-    return column.find_ancestor(exp.Where, exp.Join) is not None
+def _map_output_name(name: str, alias_columns: list[str], source: Scope) -> str:
+    """Map a reference-site column name to the resolved source's output column.
 
+    A same-named source alias may carry a positional alias list, e.g.
+    ``JOIN (SELECT ...) AS s(p, q)``; the source's real output for reference ``s.p`` is
+    its first projection, not ``p`` itself. Consumers need that real name to select the
+    right output of the source scope.
+    """
+    outputs = list(getattr(source.expression, "named_selects", []) or [])
+    if alias_columns and name in alias_columns:
+        index = alias_columns.index(name)
+        if 0 <= index < len(outputs):
+            return outputs[index]
 
-def _predicate_dependencies(
-    relation: RecursiveRelation, name_to_index: dict[str, int]
-) -> tuple[set[int], set[tuple[str, str]]]:
-    recursive_indexes: set[int] = set()
-    external_keys: set[tuple[str, str]] = set()
-
-    for scope_expression in (relation.anchor_scope.expression, relation.recursive_scope.expression):
-        clauses: list[exp.Expr] = []
-        where = scope_expression.args.get("where")
-        if where is not None:
-            clauses.append(where)
-        for join in scope_expression.args.get("joins") or []:
-            on = join.args.get("on")
-            if on is not None:
-                clauses.append(on)
-
-        for clause in clauses:
-            for column in find_all_in_scope(clause, exp.Column):
-                if column.table == relation.name:
-                    if column.name in name_to_index:
-                        recursive_indexes.add(name_to_index[column.name])
-                else:
-                    external_keys.add((column.table, column.name))
-
-    return recursive_indexes, external_keys
+    return name

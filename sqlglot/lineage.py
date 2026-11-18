@@ -691,43 +691,68 @@ def _recursive_to_node(
         on_node(anchor_node)
         on_node(recursive_node)
 
-    external_cache: dict[tuple[str, str], Node] = {}
+    external_cache: dict[t.Any, Node] = {}
+    # Flow keys identify a query source by expression identity; resolve each to its Scope
+    # once per analysis instead of walking the scope tree for every relation output.
+    root = scope.root_scope
+    source_scopes: dict[int, Scope] = (
+        _flow_cache.setdefault(("source_scopes", id(root)), {}) if _flow_cache is not None else {}
+    )
 
-    def external_node(key: tuple[str, str], owner: Node) -> None:
-        """Trace one non-relation column read to its base-table sources."""
+    def source_scope(key: t.Any) -> Scope | None:
+        if key[0] != "query":
+            return None
+        expression_id = int(key[1])
+        found = source_scopes.get(expression_id)
+        if found is None:
+            found = flow.scope_for_key(key, root)
+            if found is not None:
+                source_scopes[expression_id] = found
+        return found
+
+    def external_node(key: t.Any, owner: Node) -> None:
+        """Trace one non-relation column read to its base-table sources.
+
+        The flow already resolved the reference to a source identity, so the local alias
+        spelling is only used for labels. Two arms that reuse an alias therefore trace to
+        their own sources, and an aliased self-reference never becomes an external leaf.
+        """
         cached = external_cache.get(key)
         if cached is not None:
             owner.downstream.append(cached)
             return
 
-        table, name = key
-        source = recursive_scope.sources.get(table) or anchor_scope.sources.get(table)
-        if isinstance(source, Scope):
-            to_node(
-                name,
-                scope=source,
-                dialect=dialect,
-                scope_name=table,
-                upstream=owner,
-                trim_selects=trim_selects,
-                schema=schema,
-                _cache=_cache,
-                _scope_meta=_scope_meta,
-                _flow_cache=_flow_cache,
-                on_node=on_node,
-            )
-            external_cache[key] = owner.downstream[-1]
-        else:
-            col_expr = source or exp.Placeholder()
-            leaf = Node(
-                name=exp.column(name, table=table).sql(comments=False),
-                source=col_expr,
-                expression=col_expr,
-            )
-            owner.downstream.append(leaf)
-            external_cache[key] = leaf
-            if on_node:
-                on_node(leaf)
+        entry = flow.external[key]
+        if entry.kind == "query":
+            source = source_scope(key)
+            if source is not None:
+                to_node(
+                    entry.output_name,
+                    scope=source,
+                    dialect=dialect,
+                    scope_name=entry.table,
+                    upstream=owner,
+                    trim_selects=trim_selects,
+                    schema=schema,
+                    _cache=_cache,
+                    _scope_meta=_scope_meta,
+                    _flow_cache=_flow_cache,
+                    on_node=on_node,
+                )
+                external_cache[key] = owner.downstream[-1]
+                return
+
+        # Base tables and unresolved references end the lineage at the source expression.
+        leaf_source = entry.expression
+        leaf = Node(
+            name=exp.column(entry.name, table=entry.table).sql(comments=False),
+            source=leaf_source,
+            expression=leaf_source,
+        )
+        owner.downstream.append(leaf)
+        external_cache[key] = leaf
+        if on_node:
+            on_node(leaf)
 
     for key in flow.anchor_inputs[index]:
         external_node(key, anchor_node)

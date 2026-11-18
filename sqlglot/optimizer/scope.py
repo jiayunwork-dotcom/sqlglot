@@ -23,10 +23,46 @@ if t.TYPE_CHECKING:
 TRAVERSABLES = (exp.Query, exp.DDL, exp.DML)
 
 
-# CTE node id -> weak references of every RecursiveRelation binding built for it. The
-# registry never owns either the AST or a binding, so scope rebuilds and expression
-# copies leave nothing behind; stale weak references are pruned on access.
-_recursive_relation_registry: dict[int, list[ref[RecursiveRelation]]] = {}
+# CTE node id -> (weak reference to the CTE, weak references of every RecursiveRelation
+# binding built for it). The registry never owns either the AST or a binding, so scope
+# rebuilds and expression copies leave nothing behind; stale entries are pruned as they
+# are seen and the table is swept periodically, so it is bounded by the number of live
+# recursive relations rather than by the number of historical analyses.
+_recursive_relation_registry: dict[int, tuple[ref[exp.CTE], list[ref[RecursiveRelation]]]] = {}
+_recursive_registry_clock = 0
+_RECURSIVE_REGISTRY_SWEEP = 64
+
+
+def _register_recursive_relation(binding: RecursiveRelation) -> None:
+    global _recursive_registry_clock
+
+    cte = binding.cte
+    key = id(cte)
+    entry = _recursive_relation_registry.get(key)
+    if entry is None or entry[0]() is not cte:
+        relations: list[ref[RecursiveRelation]] = []
+        _recursive_relation_registry[key] = (ref(cte), relations)
+    else:
+        relations = [relation for relation in entry[1] if relation() is not None]
+
+    # A binding retained from an earlier traversal for this same CTE may already hold a
+    # valid flow; reuse it instead of recomputing the dependency summary.
+    for relation_ref in relations:
+        other = relation_ref()
+        if other is not None and other is not binding and other._flow is not None:
+            binding._flow = other._flow
+            break
+
+    relations.append(ref(binding))
+    _recursive_relation_registry[key] = (_recursive_relation_registry[key][0], relations)
+
+    _recursive_registry_clock += 1
+    if _recursive_registry_clock >= _RECURSIVE_REGISTRY_SWEEP:
+        _recursive_registry_clock = 0
+        for registered, (cte_ref, _) in list(_recursive_relation_registry.items()):
+            if cte_ref() is None:
+                del _recursive_relation_registry[registered]
+
 
 ROW_LEVEL_AGG_FUNCS = (exp.Count,)
 
@@ -134,13 +170,7 @@ class RecursiveRelation:
         # cache survives a scope rebuild over the same AST without keeping either the AST
         # or the binding alive.
         self._flow: RecursiveFlow | None = None
-        relations = _recursive_relation_registry.setdefault(id(cte), [])
-        relations.append(ref(self))
-        for other in relations:
-            cached = other()
-            if cached is not None and cached is not self and cached._flow is not None:
-                self._flow = cached._flow
-                break
+        _register_recursive_relation(self)
 
     @property
     def flow(self) -> RecursiveFlow:
@@ -153,7 +183,12 @@ class RecursiveRelation:
 
     def invalidate_flow(self) -> None:
         """Drop this relation's cached flow, including on earlier bindings for the same CTE."""
-        for binding_ref in _recursive_relation_registry.get(id(self.cte), []):
+        entry = _recursive_relation_registry.get(id(self.cte))
+        if entry is None or entry[0]() is not self.cte:
+            self._flow = None
+            return
+
+        for binding_ref in entry[1]:
             binding = binding_ref()
             if binding is not None:
                 binding._flow = None

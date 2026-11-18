@@ -229,6 +229,23 @@ def projection_reachability(
 
         return owners[id(node)]
 
+    # Every scope of a supported recursive relation - the UNION scope and both arms -
+    # shares one finite flow summary. The arms do not carry the binding themselves, so
+    # index them here; the anchor arm needs the flow to know that its column list is
+    # pruned in lockstep while its real sources still own the demanded columns.
+    flow_by_scope: dict[Scope, RecursiveFlow] = {}
+    for scope in scopes:
+        relation = scope.recursive_relation
+        if (
+            relation is not None
+            and relation.supported
+            and isinstance(scope.expression, exp.SetOperation)
+        ):
+            relation_flow = relation.flow
+            flow_by_scope[scope] = relation_flow
+            for arm in scope.set_operation_scopes:
+                flow_by_scope[arm] = relation_flow
+
     for scope in scopes:
         query = scope.expression
         scope_node = scope_nodes[scope]
@@ -244,11 +261,7 @@ def projection_reachability(
             or (_is_self_referencing_cte(scope) and not supported_recursive)
             or not isinstance(query, (exp.Select, exp.SetOperation))
         )
-        recursive_flow: RecursiveFlow | None = None
-        if relation is not None and relation.supported:
-            # The same finite flow is reused by the union scope and both arms, so the
-            # recursive analysis is computed once per relation regardless of references.
-            recursive_flow = relation.flow
+        recursive_flow: RecursiveFlow | None = flow_by_scope.get(scope)
 
         # The containing expression requires the subquery's scope node and all its outputs.
         for child in scope.subquery_scopes:
@@ -281,17 +294,18 @@ def projection_reachability(
                 # projection i plus the recursive-term projections feeding it through the
                 # relation's own column swaps. The fixpoint closure below then adds every
                 # column needed for value transfer and row conditions.
+                flow = recursive_flow
+
                 def add_external(
-                    owner_node: DependencyNode, arm: Scope, key: tuple[str, str]
+                    owner_node: DependencyNode, key: tuple, flow: RecursiveFlow = flow
                 ) -> None:
-                    table, column_name = key
-                    external_source = (
-                        scopes_by_expression.get(id(arm.sources[table].expression))
-                        if isinstance(arm.sources.get(table), Scope)
-                        else None
-                    )
+                    # The flow resolved this reference to a source identity; reuse that
+                    # decision here instead of re-interpreting the local alias, which may
+                    # mean a different source in the other arm.
+                    entry = flow.external[key]
+                    external_source = _keyed_source_scope(key, scopes_by_expression)
                     if external_source is not None:
-                        for target in outputs_by_name[external_source].get(column_name, []):
+                        for target in outputs_by_name[external_source].get(entry.output_name, []):
                             owner_node.dependencies.append(target)
 
                 consumed_by_other: set[int] = set()
@@ -316,9 +330,9 @@ def projection_reachability(
                             continue
                         union_output.dependencies.append(output_nodes[right][producer])
                     for key in recursive_flow.anchor_inputs[i]:
-                        add_external(union_output, left, key)
+                        add_external(union_output, key)
                     for key in recursive_flow.recursive_external[i]:
-                        add_external(union_output, right, key)
+                        add_external(union_output, key)
             else:
                 # Match outputs by name for BY NAME, otherwise by position. A retained output
                 # requires its matching branch outputs. Reverse edges propagate columns required
@@ -400,11 +414,12 @@ def projection_reachability(
 
             # A recursive arm's reference to its own relation is modeled by the fixed-point
             # edges above; treating it as an ordinary scope dependency would mark every
-            # relation column live and defeat pruning.
+            # relation column live and defeat pruning. The reference may use any local
+            # alias (FROM r AS rr), so match the referenced table, not the alias spelling.
             recursive_self_ref = False
-            if recursive_flow is not None and name == recursive_flow.relation.name:
+            if recursive_flow is not None:
                 relation_scope = recursive_flow.relation.scope
-                recursive_self_ref = source is relation_scope and (
+                recursive_self_ref = _is_relation_self_reference(reference, recursive_flow) and (
                     scope is relation_scope or scope in relation_scope.set_operation_scopes
                 )
 
@@ -434,16 +449,22 @@ def projection_reachability(
         for col in scope.columns:
             # Self-references inside a recursive arm are modeled by the fixed-point edges
             # below; the generic column loop would route them through the whole relation
-            # scope and keep every column, including pure self-loop dead columns.
-            if (
-                recursive_flow is not None
-                and col.table == recursive_flow.relation.name
-                and (
-                    scope is recursive_flow.relation.scope
-                    or scope in recursive_flow.relation.scope.set_operation_scopes
-                )
-            ):
-                continue
+            # scope and keep every column, including pure self-loop dead columns. The flow
+            # classified each reference site, so a local alias cannot disguise one.
+            if recursive_flow is not None:
+                if recursive_flow.self_column_index(col) is not None:
+                    continue
+                external_key = recursive_flow.column_key(col)
+                if external_key is not None:
+                    # The flow resolved this reference to its real source; ask that
+                    # source for its output instead of re-interpreting the local alias.
+                    entry = recursive_flow.external[external_key]
+                    external_source = _keyed_source_scope(external_key, scopes_by_expression)
+                    if external_source is not None:
+                        owner(col).dependencies.extend(
+                            outputs_by_name[external_source].get(entry.output_name, [])
+                        )
+                    continue
             source = scope.sources.get(col.table or col.name)
             if isinstance(source, Scope):
                 source = scopes_by_expression[id(source.expression)]
@@ -466,13 +487,20 @@ def projection_reachability(
                 if i in recursive_flow.predicate_recursive:
                     scope_nodes[right].dependencies.append(output_nodes[right][i])
 
-            for table, column_name in recursive_flow.condition_external:
-                condition_source = right.sources.get(table)
-                if isinstance(condition_source, Scope):
-                    condition_source = scopes_by_expression[id(condition_source.expression)]
-                    scope_nodes[right].dependencies.extend(
-                        outputs_by_name[condition_source].get(column_name, [])
-                    )
+            # Conditions are routed to the arm that actually wrote them: the flow resolved
+            # each reference to a source identity, so same-named aliases in the other arm
+            # are never consulted.
+            for condition_scope, keys in (
+                (left, recursive_flow.anchor_conditions),
+                (right, recursive_flow.recursive_conditions),
+            ):
+                for key in keys:
+                    condition_source = _keyed_source_scope(key, scopes_by_expression)
+                    if condition_source is not None:
+                        entry = recursive_flow.external[key]
+                        scope_nodes[condition_scope].dependencies.extend(
+                            outputs_by_name[condition_source].get(entry.output_name, [])
+                        )
 
     # DML/DDL can have several independent queries and CTEs referenced outside any query.
     roots = (
@@ -719,6 +747,31 @@ def _output_column_refs(expression: exp.Expr, scoped: bool) -> set[str]:
             refs.update(c.name for c in columns if not c.table)
 
     return refs
+
+
+def _is_relation_self_reference(reference: exp.Expr, flow: RecursiveFlow) -> bool:
+    """Whether ``reference`` names the relation itself (possibly under another alias)."""
+    return (
+        isinstance(reference, exp.Table)
+        and not reference.db
+        and reference.name == flow.relation.name
+    )
+
+
+def _keyed_source_scope(
+    key: tuple,
+    scopes_by_expression: dict[int, Scope],
+) -> Scope | None:
+    """Resolve a flow source key to a Scope in this analysis.
+
+    Query sources are identified by their query expression, so the lookup survives the
+    extra Scope objects built for recursive references. Bare tables and unresolved keys
+    have no scope here.
+    """
+    if key[0] != "query":
+        return None
+
+    return scopes_by_expression.get(int(key[1]))
 
 
 def _is_self_referencing_cte(scope: Scope) -> bool:

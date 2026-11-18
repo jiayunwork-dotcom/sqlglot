@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from typing import ClassVar
 
 import sqlglot
 from sqlglot.lineage import lineage
@@ -1545,3 +1546,82 @@ class TestRecursiveLineage(unittest.TestCase):
         self.assertEqual(len(walked), len({id(n) for n in walked}))
         html = node.to_html()
         self.assertEqual(len(html.nodes), len(walked))
+
+    # --- Regression: local names must not leak across the two recursive arms ---
+
+    SAME_ALIAS_SCHEMA: ClassVar[dict] = {
+        "seed": {"x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+        "extra": {"id": "INTEGER", "x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+    }
+
+    SAME_ALIAS_SQL = """
+        WITH RECURSIVE
+          a AS (SELECT x,flag,z FROM seed),
+          b AS (SELECT id,x,flag,z FROM extra),
+          r(v,n,dead) AS (
+            SELECT s.x,0,s.z FROM a s WHERE s.flag=1
+            UNION ALL
+            SELECT r.v+s.x,r.n+1,r.dead FROM r JOIN b s ON s.id=r.n WHERE r.n<2
+          )
+        SELECT v FROM r
+    """
+
+    def test_recursive_same_alias_in_both_arms_keeps_both_sources(self):
+        # `s` denotes a in the anchor and b in the recursive term. It is a local name,
+        # so resolving it in one arm must not decide the other arm's source.
+        node = lineage("v", self.SAME_ALIAS_SQL, schema=self.SAME_ALIAS_SCHEMA, dialect="sqlite")
+        self.assertEqual(
+            self._table_columns(node),
+            [("extra", "x"), ("seed", "x")],
+        )
+
+        renamed = (
+            self.SAME_ALIAS_SQL.replace("FROM a s", "FROM a t")
+            .replace("s.x,0,s.z", "t.x,0,t.z")
+            .replace("WHERE s.flag", "WHERE t.flag")
+        )
+        self.assertEqual(
+            self._table_columns(
+                lineage("v", renamed, schema=self.SAME_ALIAS_SCHEMA, dialect="sqlite")
+            ),
+            [("extra", "x"), ("seed", "x")],
+        )
+
+    def test_recursive_same_alias_predicates_are_not_value_sources(self):
+        node = lineage("v", self.SAME_ALIAS_SQL, schema=self.SAME_ALIAS_SCHEMA, dialect="sqlite")
+        names = {column for _, column in self._table_columns(node)}
+        # seed.flag and extra.id only shape rows through WHERE / ON.
+        self.assertNotIn("flag", names)
+        self.assertNotIn("id", names)
+        self.assertNotIn("z", names)
+
+    def test_recursive_aliased_self_reference_keeps_its_columns(self):
+        # The self-reference uses rr, not the CTE name; it is still the relation.
+        sql = """
+            WITH RECURSIVE r(v,n) AS (
+              SELECT x,0 FROM seed WHERE flag=1
+              UNION ALL
+              SELECT rr.v+s.x, rr.n+1 FROM r rr JOIN extra s ON s.id=rr.n WHERE rr.n<2
+            )
+            SELECT v FROM r
+        """
+        node = lineage("v", sql, schema=self.SAME_ALIAS_SCHEMA, dialect="sqlite")
+        self.assertEqual(self._table_columns(node), [("extra", "x"), ("seed", "x")])
+
+    def test_recursive_same_name_ctes_in_nested_scopes_stay_distinct(self):
+        # Two different same-named CTE sources, reached from the two arms under one
+        # alias, must not be merged by name.
+        schema = {
+            "seed": {"x": "INTEGER", "flag": "INTEGER"},
+            "extra": {"id": "INTEGER", "x": "INTEGER"},
+        }
+        sql = """
+            WITH RECURSIVE r(v,n) AS (
+              SELECT s.x,0 FROM (SELECT x FROM seed WHERE flag=1) AS s
+              UNION ALL
+              SELECT r.v+s.x,r.n+1 FROM r JOIN (SELECT id,x FROM extra) AS s ON s.id=r.n WHERE r.n<2
+            )
+            SELECT v FROM r
+        """
+        node = lineage("v", sql, schema=schema, dialect="sqlite")
+        self.assertEqual(self._table_columns(node), [("extra", "x"), ("seed", "x")])

@@ -4476,6 +4476,241 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         self.assertIn("e.id = r.n", rendered)
         self.assertNotIn("dead", rendered)
 
+    def test_recursive_pushdown_same_alias_does_not_leak_demand_between_arms(self):
+        schema = {
+            "seed": {"x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+            "extra": {"id": "INTEGER", "x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+        }
+        sql = """
+            WITH RECURSIVE
+              a AS (SELECT x,flag,z FROM seed),
+              b AS (SELECT id,x,flag,z FROM extra),
+              r(v,n,dead) AS (
+                SELECT s.x,0,s.z FROM a s WHERE s.flag=1
+                UNION ALL
+                SELECT r.v+s.x,r.n+1,r.dead FROM r JOIN b s ON s.id=r.n WHERE r.n<2
+              )
+            SELECT v FROM r
+        """
+        optimized = pushdown_projections(
+            parse_one(sql, read="sqlite"), schema=schema, dialect="sqlite"
+        )
+        cte = next(c for c in optimized.find_all(exp.CTE) if c.alias == "r")
+        # dead is pruned, n and the row-condition columns stay.
+        self.assertEqual(cte.alias_column_names, ["v", "n"])
+        for arm in (cte.this.this, cte.this.expression):
+            self.assertEqual([s.alias_or_name for s in arm.selects], ["v", "n"])
+
+        # b.flag is controlled by the other arm's s.flag; it is not needed here and must
+        # be pruned instead of being pinned by the shared local name.
+        b_cte = next(c for c in optimized.find_all(exp.CTE) if c.alias == "b")
+        self.assertEqual([s.alias_or_name for s in b_cte.this.selects], ["id", "x"])
+        rendered = optimized.sql("sqlite")
+        self.assertIn("s.flag = 1", rendered)
+        self.assertIn("s.id = r.n", rendered)
+        self.assertIn("r.n < 2", rendered)
+        self.assertNotIn("dead", rendered)
+
+    def test_recursive_pushdown_local_rename_matches(self):
+        schema = {
+            "seed": {"x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+            "extra": {"id": "INTEGER", "x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+        }
+        sql = """
+            WITH RECURSIVE
+              a AS (SELECT x,flag,z FROM seed),
+              b AS (SELECT id,x,flag,z FROM extra),
+              r(v,n,dead) AS (
+                SELECT t.x,0,t.z FROM a t WHERE t.flag=1
+                UNION ALL
+                SELECT r.v+s.x,r.n+1,r.dead FROM r JOIN b s ON s.id=r.n WHERE r.n<2
+              )
+            SELECT v FROM r
+        """
+        optimized = pushdown_projections(
+            parse_one(sql, read="sqlite"), schema=schema, dialect="sqlite"
+        )
+        b_cte = next(c for c in optimized.find_all(exp.CTE) if c.alias == "b")
+        self.assertEqual([s.alias_or_name for s in b_cte.this.selects], ["id", "x"])
+
+    def test_recursive_pushdown_aliased_self_reference_keeps_predicate_column(self):
+        schema = {
+            "seed": {"x": "INTEGER", "flag": "INTEGER"},
+            "extra": {"id": "INTEGER", "x": "INTEGER"},
+        }
+        sql = """
+            WITH RECURSIVE r(v,n) AS (
+              SELECT x,0 FROM seed WHERE flag=1
+              UNION ALL
+              SELECT rr.v+s.x, rr.n+1 FROM r rr JOIN extra s ON s.id=rr.n WHERE rr.n<2
+            )
+            SELECT v FROM r
+        """
+        optimized = pushdown_projections(
+            parse_one(sql, read="sqlite"), schema=schema, dialect="sqlite"
+        )
+        cte = optimized.find(exp.CTE)
+        # n is read by WHERE rr.n < 2, so the local alias must not hide that role.
+        self.assertEqual(cte.alias_column_names, ["v", "n"])
+
+    def test_recursive_analysis_state_is_bounded_and_reusable(self):
+        from sqlglot.lineage import lineage
+        from sqlglot.optimizer import scope as scope_module
+        from sqlglot.optimizer.recursive import build_recursive_flow
+
+        schema = {
+            "seed": {"x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+            "extra": {"id": "INTEGER", "x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+        }
+        sql = """
+            WITH RECURSIVE
+              a AS (SELECT x,flag,z FROM seed),
+              b AS (SELECT id,x,flag,z FROM extra),
+              r(v,n,dead) AS (
+                SELECT s.x,0,s.z FROM a s WHERE s.flag=1
+                UNION ALL
+                SELECT r.v+s.x,r.n+1,r.dead FROM r JOIN b s ON s.id=r.n WHERE r.n<2
+              )
+            SELECT v FROM r
+        """
+
+        # One flow per relation binding, reused by every output and every reference.
+        qualified = optimizer.qualify.qualify(
+            parse_one(sql, dialect="sqlite"),
+            schema=schema,
+            dialect="sqlite",
+            identify=False,
+            validate_qualify_columns=False,
+        )
+        root = build_scope(qualified)
+        union = next(
+            s
+            for s in root.traverse()
+            if s.recursive_relation is not None and isinstance(s.expression, exp.SetOperation)
+        )
+        binding = union.recursive_relation
+        first = build_recursive_flow(binding)
+        self.assertIs(build_recursive_flow(binding), first)
+        self.assertIs(binding.flow, first)
+
+        # Repeated pruning keeps the same meaning and is idempotent.
+        qualified = optimizer.qualify.qualify(
+            parse_one(sql, dialect="sqlite"),
+            schema=schema,
+            dialect="sqlite",
+            identify=False,
+            validate_qualify_columns=False,
+        )
+        optimizer.pushdown_projections.pushdown_projections(qualified)
+        once = qualified.sql("sqlite")
+        optimizer.pushdown_projections.pushdown_projections(qualified)
+        self.assertEqual(qualified.sql("sqlite"), once)
+
+        # Interleave analyses and an invalid input; a later valid analysis must be clean.
+        lineage("v", sql, schema=schema, dialect="sqlite")
+        from sqlglot.errors import SqlglotError
+
+        with self.assertRaises(SqlglotError):
+            lineage("missing", sql, schema=schema, dialect="sqlite")
+        node = lineage("v", sql, schema=schema, dialect="sqlite")
+        self.assertEqual(
+            sorted(
+                {
+                    (n.expression.name, n.name.split(".")[-1])
+                    for n in node.walk()
+                    if isinstance(n.expression, exp.Table)
+                }
+            ),
+            [("extra", "x"), ("seed", "x")],
+        )
+
+        # The binding registry is swept, so repeated analyses do not accumulate one
+        # entry per historical call: its size plateaus instead of growing with history.
+        import gc
+
+        for _ in range(200):
+            lineage("v", sql, schema=schema, dialect="sqlite")
+            gc.collect()
+        registered = scope_module._recursive_relation_registry
+        self.assertLessEqual(len(registered), 32)
+
+    def test_recursive_pushdown_preserves_sqlite_results(self):
+        import sqlite3
+
+        schema = {
+            "seed": {"x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+            "extra": {"id": "INTEGER", "x": "INTEGER", "flag": "INTEGER", "z": "INTEGER"},
+        }
+        queries = [
+            # The local alias is reused for two different sources.
+            """
+            WITH RECURSIVE
+              a AS (SELECT x,flag,z FROM seed),
+              b AS (SELECT id,x,flag,z FROM extra),
+              r(v,n,dead) AS (
+                SELECT s.x,0,s.z FROM a s WHERE s.flag=1
+                UNION ALL
+                SELECT r.v+s.x,r.n+1,r.dead FROM r JOIN b s ON s.id=r.n WHERE r.n<2
+              )
+            SELECT v FROM r
+            """,
+            # Same query with the anchor alias renamed.
+            """
+            WITH RECURSIVE
+              a AS (SELECT x,flag,z FROM seed),
+              b AS (SELECT id,x,flag,z FROM extra),
+              r(v,n,dead) AS (
+                SELECT t.x,0,t.z FROM a t WHERE t.flag=1
+                UNION ALL
+                SELECT r.v+s.x,r.n+1,r.dead FROM r JOIN b s ON s.id=r.n WHERE r.n<2
+              )
+            SELECT v FROM r
+            """,
+            # Aliased self-reference.
+            """
+            WITH RECURSIVE r(v,n,dead) AS (
+              SELECT s.x,0,s.z FROM seed s WHERE s.flag=1
+              UNION ALL
+              SELECT rr.v+s.x, rr.n+1, rr.dead
+              FROM r rr JOIN extra s ON s.id=rr.n WHERE rr.n<2
+            )
+            SELECT v FROM r
+            """,
+        ]
+
+        def execute(conn, sql):
+            cursor = conn.execute(sql)
+            return [d[0] for d in cursor.description], cursor.fetchall()
+
+        for sql in queries:
+            with self.subTest(sql=sql):
+                pruned = pushdown_projections(
+                    parse_one(sql, read="sqlite"), schema=schema, dialect="sqlite"
+                ).sql("sqlite")
+
+                conn = sqlite3.connect(":memory:")
+                try:
+                    conn.execute("CREATE TABLE seed(x INTEGER, flag INTEGER, z INTEGER)")
+                    conn.execute(
+                        "CREATE TABLE extra(id INTEGER, x INTEGER, flag INTEGER, z INTEGER)"
+                    )
+                    conn.executemany(
+                        "INSERT INTO seed VALUES (?, ?, ?)", [(10, 1, 90), (20, 0, 80)]
+                    )
+                    conn.executemany(
+                        "INSERT INTO extra VALUES (?, ?, ?, ?)",
+                        [(0, 3, 0, 7), (1, 5, 0, 8)],
+                    )
+                    original_result = execute(conn, sql)
+                    pruned_result = execute(conn, pruned)
+                finally:
+                    conn.close()
+
+                self.assertEqual(original_result[0], pruned_result[0])
+                self.assertEqual(sorted(original_result[1]), sorted(pruned_result[1]))
+                self.assertEqual(original_result[1], [(10,), (13,), (18,)])
+                self.assertNotIn("dead", pruned)
+
     def test_recursive_pushdown_unsupported_shape_keeps_everything(self):
         schema = {"t": {"a": "INT", "b": "INT"}}
         # UNION DISTINCT is outside the supported fixed-point shape
